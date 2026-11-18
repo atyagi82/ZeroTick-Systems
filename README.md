@@ -118,7 +118,7 @@ All three conditions must agree before an entry signal is produced. The position
 These are unoptimized research values, not profit recommendations. Live order placement remains explicitly disabled in the Kite adapter.
 
 
-19th November First Testing
+## 19th November First Testing
 
 Release\zerotick.exe --login
 Starting Kite login in your browser...
