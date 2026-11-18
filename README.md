@@ -47,6 +47,4 @@ This project does not guarantee profits or suitability for any trading strategy.
 
 Detailed build instructions will be added as the C++ project structure and dependencies are established.
 
-## License
-
-License information will be added with the project's initial implementation.
+## ANM PROJECT ##
