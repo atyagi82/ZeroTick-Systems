@@ -1,4 +1,5 @@
 #include "zerotick/EngineTypes.h"
+#include "zerotick/BacktestEngine.h"
 #include "zerotick/StockSelectionEngine.h"
 #include "zerotick/TradingDecisionEngine.h"
 #include "zerotick/TradeHandlingEngine.h"
@@ -61,6 +62,23 @@ public:
 private:
     std::vector<std::string> symbols_;
 };
+
+zerotick::HistoricalCandle makeCandle(
+    const std::string& timestamp,
+    double open,
+    double high,
+    double low,
+    double close,
+    std::uint64_t volume) {
+    zerotick::HistoricalCandle candle;
+    candle.timestamp = timestamp;
+    candle.open = open;
+    candle.high = high;
+    candle.low = low;
+    candle.close = close;
+    candle.volume = volume;
+    return candle;
+}
 
 class FakeKiteApi : public zerotick::KiteApi {
 public:
@@ -373,6 +391,14 @@ void testDecisionEmitsSignal() {
             "target above entry limit");
     require(signal.stopLossPrice < signal.entryLimitPrice,
             "stop below entry limit");
+    require(std::abs(
+                signal.targetPrice -
+                signal.entryLimitPrice * 1.004) < 1e-8,
+            "default target is 0.4 percent above entry limit");
+    require(std::abs(
+                signal.stopLossPrice -
+                signal.entryLimitPrice * 0.998) < 1e-8,
+            "default stop is 0.2 percent below entry limit");
     require(signal.quantity > 0, "signal quantity set");
 
     engine.stop();
@@ -463,6 +489,82 @@ void testFreeCashSubtractsExistingUtilization() {
         "intraday payin should be included but capped at live balance");
 }
 
+void testBacktestUsesNextCandleEntryAndTargetExit() {
+    TestUniverse universe({"TEST"});
+    std::map<std::string, std::vector<zerotick::HistoricalCandle>> data;
+    data["TEST"] = {
+        makeCandle("2026-11-18T09:15:00+0530",
+                   150.0, 151.0, 149.0, 150.0, 100000),
+        makeCandle("2026-11-18T09:16:00+0530",
+                   150.0, 151.2, 149.9, 150.15, 1000),
+        makeCandle("2026-11-18T09:17:00+0530",
+                   150.15, 150.18, 150.14, 150.16, 1000),
+        makeCandle("2026-11-18T09:18:00+0530",
+                   150.2, 151.0, 150.0, 150.6, 1000)
+    };
+    std::map<std::string, double> tickSizes;
+    tickSizes["TEST"] = 0.01;
+
+    zerotick::BacktestConfig config;
+    config.initialCapital = 10000.0;
+    config.selection.minPrice = 100.0;
+    config.selection.minAbsoluteVolume = 1;
+    config.selection.minRelativeVolume = 0.0;
+    config.selection.minIntradayRangePercent = 0.3;
+    config.decision.requireVolumeConfirmation = false;
+
+    zerotick::BacktestEngine engine;
+    const zerotick::BacktestResult result =
+        engine.run(universe, data, tickSizes, config);
+    require(result.generatedSignals == 1, "one candle signal should qualify");
+    require(result.filledEntries == 1, "next candle should fill the entry");
+    require(result.trades.size() == 1, "one trade should close");
+    require(result.trades[0].entryTime == "2026-11-18T09:17:00+0530",
+            "entry must not fill on the signal candle");
+    require(result.trades[0].exitReason == "target",
+            "a later candle reaching target should exit the trade");
+    require(result.trades[0].quantity == 6,
+            "ten-thousand capital uses one-thousand position slots");
+    require(result.grossProfitLoss > 0.0,
+            "target exit should produce positive gross P&L");
+    require(std::abs(result.endingCapital -
+                     (result.initialCapital + result.grossProfitLoss)) <
+                0.0001,
+            "ending capital should reconcile to gross P&L");
+}
+
+void testBacktestUsesStopFirstWhenCandleTouchesBothLevels() {
+    TestUniverse universe({"TEST"});
+    std::map<std::string, std::vector<zerotick::HistoricalCandle>> data;
+    data["TEST"] = {
+        makeCandle("2026-11-18T09:15:00+0530",
+                   150.0, 151.0, 149.0, 150.0, 100000),
+        makeCandle("2026-11-18T09:16:00+0530",
+                   150.0, 151.2, 149.9, 150.15, 1000),
+        makeCandle("2026-11-18T09:17:00+0530",
+                   150.15, 150.18, 150.14, 150.16, 1000),
+        makeCandle("2026-11-18T09:18:00+0530",
+                   150.16, 151.0, 149.0, 150.0, 1000)
+    };
+    std::map<std::string, double> tickSizes;
+    tickSizes["TEST"] = 0.01;
+
+    zerotick::BacktestConfig config;
+    config.selection.minAbsoluteVolume = 1;
+    config.selection.minRelativeVolume = 0.0;
+    config.selection.minIntradayRangePercent = 0.3;
+    config.decision.requireVolumeConfirmation = false;
+
+    zerotick::BacktestEngine engine;
+    const zerotick::BacktestResult result =
+        engine.run(universe, data, tickSizes, config);
+    require(result.trades.size() == 1, "trade should close on the test bar");
+    require(result.trades[0].exitReason == "stop_loss",
+            "ambiguous bars should assume the stop was hit first");
+    require(result.trades[0].grossProfitLoss < 0.0,
+            "stop-first handling should record a conservative loss");
+}
+
 void testFullPipelinePaperMode() {
     zerotick::MarketSnapshot baseline =
         makeQuote(150.0, 200000, 5000, 1000, 149.0, 151.0, 148.0);
@@ -543,6 +645,8 @@ int main() {
         testQuantityUsesFullEqualSlotBudget();
         testPortfolioRiskManagerLimitsAndDividesSlotsEqually();
         testFreeCashSubtractsExistingUtilization();
+        testBacktestUsesNextCandleEntryAndTargetExit();
+        testBacktestUsesStopFirstWhenCandleTouchesBothLevels();
         testFullPipelinePaperMode();
     } catch (const std::exception& exception) {
         std::cerr << "Engine test failed: " << exception.what() << '\n';

@@ -8,9 +8,10 @@
 
 | Area | Main files | Responsibility |
 |---|---|---|
-| Application lifecycle | `src/main.cpp` | Parse flags, authenticate, seed quotes, wire queues and engines, poll quotes, shut down |
+| Application lifecycle | `src/main.cpp` | Parse flags, authenticate, select live/backtest mode, wire engines, poll quotes, shut down |
+| Historical backtest | `include/zerotick/BacktestEngine.h`, `src/BacktestEngine.cpp` | Replay one-minute OHLCV with the available filters, budget model, and candle fill assumptions |
 | Broker abstraction | `include/zerotick/KiteApi.h` | Market-data and order interface, Kite adapter declaration |
-| Kite implementation | `src/KiteConnectApi.cpp` | OAuth callback, HTTP requests, quote parsing/cache, cash, order APIs |
+| Kite implementation | `src/KiteConnectApi.cpp` | OAuth callback, HTTP requests, quote cache, instrument master, historical candles, cash, order APIs |
 | Domain and concurrency | `include/zerotick/Types.h`, `include/zerotick/EngineTypes.h`, `src/EngineTypes.cpp` | Snapshots, candidates, signals, NIFTY 100 universe, registry, thread-safe queue |
 | Selection | `include/zerotick/StockSelectionEngine.h`, `src/StockSelectionEngine.cpp` | Consume quote events and filter candidates |
 | Decision | `include/zerotick/TradingDecisionEngine.h`, `src/TradingDecisionEngine.cpp` | Re-check a candidate against a fresh quote and produce trade signals |
@@ -30,6 +31,12 @@ Defined in `Types.h`. A parsed quote carries:
 
 The REST adapter timestamps snapshots when parsed. The current type has a
 `sequence` field, but the quote adapter does not populate it.
+
+### `HistoricalCandle`
+
+Defined in `Types.h`. It stores the Kite timestamp, OHLC prices, and volume
+for one minute. Candle volume is per-bar, so the backtest sums it into
+cumulative session volume before applying the live selection's volume rules.
 
 ### `StockCandidate`
 
@@ -60,8 +67,8 @@ but stale queue entries still have to be drained.
 
 ## 3. Startup, quote delivery, and shutdown
 
-1. `main` accepts `--login` and `--enable-live-trading`; unknown flags fail
-   startup.
+1. `main` accepts `--login`, `--enable-live-trading`, `--backtest`,
+   `--optimize-100-days`, and `--capital`; unknown flags fail startup.
 2. `KiteConnectApi` reads API credentials from `.env`, with environment
    variables taking precedence. If forced or no access token exists, it uses a
    browser login and a local callback listener, exchanges the request token,
@@ -81,6 +88,14 @@ but stale queue entries still have to be drained.
 Missing symbols do not produce queue events. The adapter logs a missing symbol
 once until that symbol returns in a later response, at which point it logs
 recovery.
+
+When `--backtest YYYY-MM-DD` is supplied, `main` branches before starting the
+live quote poller or trading engines. It loads the NSE equity instrument dump
+to resolve tokens and tick sizes, then requests one-minute candles for the
+NIFTY 100 symbols from 09:15 to 15:30. Calls are spaced 400 ms apart. The
+default capital is 10,000; `--capital` overrides it. Closed trades are printed
+in a text table, and the final summary line reports total profit or loss. Live
+trading is rejected in backtest mode.
 
 ## 4. Selection worker
 
@@ -120,7 +135,48 @@ summary logs are emitted at the configured five-second interval while quote
 events are being processed; counts include selected symbols, stale events,
 owned-symbol skips, and rejection reasons.
 
-## 5. Decision worker
+## 5. Historical candle replay
+
+`BacktestEngine` accepts historical candles grouped by symbol and replays
+timestamps in ascending order. For each symbol it sums bar volume into
+cumulative session volume, tracks running session highs/lows, and uses each
+bar close as the selection price. The live selection volume, price-change,
+and range gates are applied; spread and displayed-depth gates are omitted
+because candle data has no order book. The decision relative-volume
+confirmation is retained, but its spread and weighted-imbalance checks are
+omitted. The decision non-falling-price recheck is effectively tautological:
+the candle close serves as both the candidate price and the decision price.
+
+A signal is formed at the bar close. Its entry is tested only on the next
+available bar: the high must reach the trigger and the open must not gap above
+the limit. An unfilled entry is canceled after that one-bar window; this is
+not equivalent to the live 30-second timeout and can leave an order eligible
+for up to a full minute. Stop/target checks start on later bars. If a bar
+touches both, stop-loss is assumed first; gaps use the bar open as the
+simulated fill. Remaining positions are closed at each symbol's final
+available close.
+
+The risk model reserves at most ten positions, with each slot capped at
+`initialCapital / 10` and available cash. With 10,000 initial capital, the
+default slot is 1,000. P&L is gross and excludes fees, taxes, and slippage.
+The console table includes each closed trade's signal/entry/exit time, prices,
+quantity, exit reason, and gross P&L. The final summary line prints total P&L.
+Current NIFTY 100 membership is used for all dates, so this is not point-in-time
+constituent data.
+
+`--optimize-100-days` identifies the latest 100 completed sessions using the
+first configured universe symbol, then downloads the universe's one-minute
+candles in seven-calendar-day chunks. It runs each day separately so session
+volume and open positions reset daily; the resulting capital compounds
+between days. Twenty fixed variants cover five selection profiles and four
+stop/target pairs. Variants are ranked on the first 70 sessions; the last 30
+are reported separately as holdout results. Selection is based only on the
+training period, not the holdout. The report includes the current defaults for
+comparison and ends with the training-selected candidate's total 100-session
+P&L. This remains an approximate gross simulation, not a guarantee of
+profitability.
+
+## 6. Decision worker
 
 Each `TradingDecisionEngine` worker blocks on the candidate queue:
 
@@ -146,14 +202,14 @@ target      = limit * (1 + targetPercent / 100)
 stop        = limit * (1 - stopPercent / 100)
 ```
 
-The defaults are a 0.20% target and 0.40% stop. The signal quantity is an
+The defaults are a 0.40% target and 0.20% stop. The signal quantity is an
 indicative cap derived from a fixed 50,000 budget divided by entry limit; final
 quantity is recalculated by handling.
 
 On a rejected decision, release `Decision -> Unassigned`. On approval, enqueue
 the signal and keep ownership until handling claims it.
 
-## 6. Handling and portfolio risk
+## 7. Handling and portfolio risk
 
 Each handling worker blocks on the signal queue and claims
 `Decision -> Handling`.
@@ -195,7 +251,7 @@ which means the actual CLI paper path cannot reserve a slot. The paper-mode
 tests construct the risk manager with a nonzero budget, so they do not cover
 this CLI configuration gap.
 
-## 7. Kite adapter details
+## 8. Kite adapter details
 
 `KiteConnectApi` implements the `KiteApi` interface:
 
@@ -203,6 +259,8 @@ this CLI configuration gap.
 |---|---|
 | Quote refresh | Batched `/quote` requests; snapshots parsed from `last_price`, `depth`, `volume`, and `ohlc` |
 | Fresh quote read | In-memory cache lookup with a five-second receipt-age limit |
+| Backtest instrument lookup | `/instruments/NSE` CSV; resolve equity tokens and current tick sizes |
+| Historical candles | `/instruments/historical/{instrument_token}/minute` with full-day request parameters |
 | Live preflight | `/portfolio/positions` and `/orders`; block on existing MIS exposure for universe symbols |
 | Cash | `/user/margins/equity`; free cash is validated and adjusted for utilization |
 | Entry and exit | `/orders/regular` with MIS stop-limit buy and limit sell |
@@ -213,7 +271,7 @@ HTTP, JSON, authentication, and broker errors are surfaced as exceptions.
 Quote responses that omit an instrument are treated as unavailable instead of
 causing a missing-key JSON exception.
 
-## 8. Configuration and diagnostics
+## 9. Configuration and diagnostics
 
 The engine defaults are defined in `SelectionConfig`, `DecisionConfig`, and
 `HandlingConfig` in `EngineTypes.h`. Start logs report active selection
@@ -227,8 +285,13 @@ Key flags:
 - `--login`: force browser login and token exchange.
 - `--enable-live-trading`: enable actual MIS order submission; this is not a
   simulation flag.
+- `--backtest YYYY-MM-DD`: fetch and replay one-minute candles without sending
+  orders.
+- `--optimize-100-days`: download and analyze the latest 100 completed sessions
+  using the bounded parameter sweep.
+- `--capital AMOUNT`: set backtest starting capital (default 10,000).
 
-## 9. Validation
+## 10. Validation
 
 Configure, build, and run tests:
 
@@ -241,8 +304,9 @@ ctest --test-dir build -C Release --output-on-failure
 `engine_tests` covers the 100-symbol universe, ownership transitions, event
 waiting, selection filtering and price-change thresholds, decision signal
 generation, portfolio sizing/cash calculations, paper handling, and an
-end-to-end paper-mode pipeline.
+end-to-end paper-mode pipeline. It also checks next-bar backtest fills,
+target exits, and conservative stop-first handling for ambiguous candles.
 
-## 10. Related documents
+## 11. Related documents
 
 - [High-Level Design](./High%20Level%20Design.md)

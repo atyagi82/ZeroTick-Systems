@@ -80,13 +80,32 @@ public:
     void cancelOrder(const std::string& orderId) override;
     bool isHealthy() const override;
 
+    std::vector<HistoricalCandle> getHistoricalCandles(
+        const std::string& symbol,
+        const std::string& date) const;
+    std::vector<HistoricalCandle> getHistoricalCandles(
+        const std::string& symbol,
+        const std::string& fromDate,
+        const std::string& toDate) const;
+    double getInstrumentTickSize(const std::string& symbol) const;
+
 private:
+    struct InstrumentInfo {
+        std::string token;
+        double tickSize = 0.01;
+    };
+
+    void ensureInstrumentListLoaded() const;
+
     std::string apiKey_;
     std::string accessToken_;
     bool healthy_ = false;
     mutable std::mutex quoteMutex_;
     std::map<std::string, MarketSnapshot> quotes_;
     std::set<std::string> missingQuoteSymbols_;
+    mutable std::mutex instrumentMutex_;
+    mutable bool instrumentListLoaded_ = false;
+    mutable std::map<std::string, InstrumentInfo> nseInstruments_;
 };
 
 } // namespace zerotick

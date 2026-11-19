@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -57,6 +58,63 @@ std::string trim(const std::string& value) {
     }
     const std::string::size_type last = value.find_last_not_of(" \t\r\n");
     return value.substr(first, last - first + 1);
+}
+
+std::vector<std::string> parseCsvRecord(const std::string& line) {
+    std::vector<std::string> fields;
+    std::string field;
+    bool quoted = false;
+    for (std::size_t index = 0; index < line.size(); ++index) {
+        const char character = line[index];
+        if (character == '"') {
+            if (quoted && index + 1 < line.size() &&
+                line[index + 1] == '"') {
+                field += '"';
+                ++index;
+            } else {
+                quoted = !quoted;
+            }
+        } else if (character == ',' && !quoted) {
+            fields.push_back(field);
+            field.clear();
+        } else {
+            field += character;
+        }
+    }
+    if (quoted) {
+        throw std::runtime_error("Malformed Kite instrument CSV record");
+    }
+    fields.push_back(field);
+    return fields;
+}
+
+bool isValidIsoDate(const std::string& date) {
+    if (date.size() != 10 || date[4] != '-' || date[7] != '-') {
+        return false;
+    }
+    for (std::size_t index = 0; index < date.size(); ++index) {
+        if (index != 4 && index != 7 &&
+            (date[index] < '0' || date[index] > '9')) {
+            return false;
+        }
+    }
+
+    const int year = std::stoi(date.substr(0, 4));
+    const int month = std::stoi(date.substr(5, 2));
+    const int day = std::stoi(date.substr(8, 2));
+    if (year < 2000 || month < 1 || month > 12) {
+        return false;
+    }
+    static const int monthDays[] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+    int maximumDay = monthDays[month - 1];
+    const bool leapYear =
+        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    if (month == 2 && leapYear) {
+        maximumDay = 29;
+    }
+    return day >= 1 && day <= maximumDay;
 }
 
 std::map<std::string, std::string> loadCredentials() {
@@ -491,6 +549,16 @@ std::string httpRequest(
         throw std::runtime_error("Unable to initialize Kite HTTP request");
     }
 
+    // Kite's instrument dump is gzip-compressed; enable transparent decoding
+    // for that response while keeping the same request helper for JSON APIs.
+    DWORD decompressionFlags = WINHTTP_DECOMPRESSION_FLAG_GZIP;
+    if (!WinHttpSetOption(
+            request.get(), WINHTTP_OPTION_DECOMPRESSION,
+            &decompressionFlags, sizeof(decompressionFlags))) {
+        throw std::runtime_error(
+            "Unable to enable Kite HTTP gzip decompression");
+    }
+
     std::wstring headers = L"X-Kite-Version: 3\r\n";
     if (!accessToken.empty()) {
         headers += widenAscii(
@@ -708,6 +776,212 @@ KiteConnectApi::KiteConnectApi(bool forceLogin) {
     }
 
     healthy_ = true;
+}
+
+void KiteConnectApi::ensureInstrumentListLoaded() const {
+    std::lock_guard<std::mutex> lock(instrumentMutex_);
+    if (instrumentListLoaded_) {
+        return;
+    }
+
+    const std::string response = httpRequest(
+        "Kite NSE instrument list",
+        L"GET", L"/instruments/NSE", std::string(), apiKey_, accessToken_);
+    std::istringstream input(response);
+    std::string line;
+    if (!std::getline(input, line)) {
+        throw std::runtime_error("Kite returned an empty NSE instrument list");
+    }
+    if (line.size() >= 3 &&
+        static_cast<unsigned char>(line[0]) == 0xEF &&
+        static_cast<unsigned char>(line[1]) == 0xBB &&
+        static_cast<unsigned char>(line[2]) == 0xBF) {
+        line.erase(0, 3);
+    }
+
+    const std::vector<std::string> headers = parseCsvRecord(line);
+    const auto findColumn = [&headers](const std::string& name) {
+        for (std::size_t index = 0; index < headers.size(); ++index) {
+            if (trim(headers[index]) == name) {
+                return index;
+            }
+        }
+        throw std::runtime_error(
+            "Kite instrument list is missing column " + name);
+    };
+    const std::size_t tokenColumn = findColumn("instrument_token");
+    const std::size_t symbolColumn = findColumn("tradingsymbol");
+    const std::size_t tickColumn = findColumn("tick_size");
+    const std::size_t typeColumn = findColumn("instrument_type");
+    const std::size_t exchangeColumn = findColumn("exchange");
+    std::size_t requiredColumn = tokenColumn;
+    if (symbolColumn > requiredColumn) {
+        requiredColumn = symbolColumn;
+    }
+    if (tickColumn > requiredColumn) {
+        requiredColumn = tickColumn;
+    }
+    if (typeColumn > requiredColumn) {
+        requiredColumn = typeColumn;
+    }
+    if (exchangeColumn > requiredColumn) {
+        requiredColumn = exchangeColumn;
+    }
+
+    std::map<std::string, InstrumentInfo> loaded;
+    std::size_t invalidMetadataRows = 0;
+    while (std::getline(input, line)) {
+        if (trim(line).empty()) {
+            continue;
+        }
+        const std::vector<std::string> fields = parseCsvRecord(line);
+        if (fields.size() <= requiredColumn) {
+            throw std::runtime_error(
+                "Kite instrument list contains an incomplete row");
+        }
+        if (trim(fields[exchangeColumn]) != "NSE" ||
+            trim(fields[typeColumn]) != "EQ") {
+            continue;
+        }
+
+        const std::string symbol = trim(fields[symbolColumn]);
+        const std::string token = trim(fields[tokenColumn]);
+        const std::string tickText = trim(fields[tickColumn]);
+        if (symbol.empty() || token.empty()) {
+            ++invalidMetadataRows;
+            continue;
+        }
+
+        std::size_t parsedLength = 0;
+        double tickSize = 0.0;
+        try {
+            tickSize = std::stod(tickText, &parsedLength);
+        } catch (const std::invalid_argument&) {
+            ++invalidMetadataRows;
+            continue;
+        } catch (const std::out_of_range&) {
+            ++invalidMetadataRows;
+            continue;
+        }
+        if (parsedLength != tickText.size() ||
+            !std::isfinite(tickSize) || tickSize <= 0.0) {
+            ++invalidMetadataRows;
+            continue;
+        }
+        InstrumentInfo instrument;
+        instrument.token = token;
+        instrument.tickSize = tickSize;
+        loaded[symbol] = instrument;
+    }
+    if (invalidMetadataRows > 0) {
+        logLine("[kite] instrument_metadata_rows_skipped=" +
+                std::to_string(invalidMetadataRows));
+    }
+    if (loaded.empty()) {
+        throw std::runtime_error(
+            "Kite NSE instrument list contains no equity instruments");
+    }
+
+    nseInstruments_.swap(loaded);
+    instrumentListLoaded_ = true;
+}
+
+double KiteConnectApi::getInstrumentTickSize(
+    const std::string& symbol) const {
+    ensureInstrumentListLoaded();
+    std::lock_guard<std::mutex> lock(instrumentMutex_);
+    const auto found = nseInstruments_.find(symbol);
+    if (found == nseInstruments_.end()) {
+        throw std::runtime_error(
+            "Kite instrument list has no NSE equity for " + symbol);
+    }
+    return found->second.tickSize;
+}
+
+std::vector<HistoricalCandle> KiteConnectApi::getHistoricalCandles(
+    const std::string& symbol,
+    const std::string& date) const {
+    return getHistoricalCandles(symbol, date, date);
+}
+
+std::vector<HistoricalCandle> KiteConnectApi::getHistoricalCandles(
+    const std::string& symbol,
+    const std::string& fromDate,
+    const std::string& toDate) const {
+    if (!isValidIsoDate(fromDate) || !isValidIsoDate(toDate) ||
+        fromDate > toDate) {
+        throw std::invalid_argument(
+            "Backtest range must contain valid ascending YYYY-MM-DD dates");
+    }
+    ensureInstrumentListLoaded();
+
+    std::string token;
+    {
+        std::lock_guard<std::mutex> lock(instrumentMutex_);
+        const auto found = nseInstruments_.find(symbol);
+        if (found == nseInstruments_.end()) {
+            throw std::runtime_error(
+                "Kite instrument list has no NSE equity for " + symbol);
+        }
+        token = found->second.token;
+    }
+
+    const std::string from = fromDate + " 09:15:00";
+    const std::string to = toDate + " 15:30:00";
+    const std::string requestPath =
+        "/instruments/historical/" + token + "/minute?from=" +
+        urlEncode(from) + "&to=" + urlEncode(to) + "&oi=0";
+    const std::string response = httpRequest(
+        "Kite historical candle fetch",
+        L"GET", widenAscii(requestPath), std::string(), apiKey_, accessToken_);
+    const json result = json::parse(response);
+    if (result.value("status", std::string()) != "success") {
+        throw std::runtime_error(
+            "Kite historical candle request did not succeed for " + symbol);
+    }
+
+    const json& records = result.at("data").at("candles");
+    if (!records.is_array()) {
+        throw std::runtime_error(
+            "Kite returned an invalid candle list for " + symbol);
+    }
+
+    std::vector<HistoricalCandle> candles;
+    candles.reserve(records.size());
+    std::string previousTimestamp;
+    for (const json& record : records) {
+        if (!record.is_array() || record.size() < 6) {
+            throw std::runtime_error(
+                "Kite returned a malformed candle for " + symbol);
+        }
+        HistoricalCandle candle;
+        candle.timestamp = record.at(0).get<std::string>();
+        if (candle.timestamp.size() < 10) {
+            throw std::runtime_error(
+                "Kite returned a malformed candle timestamp for " + symbol);
+        }
+        const std::string candleDate = candle.timestamp.substr(0, 10);
+        candle.open = record.at(1).get<double>();
+        candle.high = record.at(2).get<double>();
+        candle.low = record.at(3).get<double>();
+        candle.close = record.at(4).get<double>();
+        candle.volume = record.at(5).get<std::uint64_t>();
+        if (candleDate < fromDate || candleDate > toDate ||
+            !std::isfinite(candle.open) || !std::isfinite(candle.high) ||
+            !std::isfinite(candle.low) || !std::isfinite(candle.close) ||
+            candle.open <= 0.0 || candle.close <= 0.0 ||
+            candle.low <= 0.0 || candle.high < candle.low ||
+            candle.high < candle.open || candle.high < candle.close ||
+            candle.low > candle.open || candle.low > candle.close ||
+            (!previousTimestamp.empty() &&
+             candle.timestamp <= previousTimestamp)) {
+            throw std::runtime_error(
+                "Kite returned invalid or unordered candles for " + symbol);
+        }
+        previousTimestamp = candle.timestamp;
+        candles.push_back(std::move(candle));
+    }
+    return candles;
 }
 
 MarketSnapshot KiteConnectApi::getQuote(const std::string& symbol) {

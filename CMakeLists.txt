@@ -20,6 +20,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nlohmann_json)
 
 add_library(zerotick_core
+    src/BacktestEngine.cpp
     src/KiteConnectApi.cpp
     src/EngineTypes.cpp
     src/StockSelectionEngine.cpp

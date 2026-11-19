@@ -8,7 +8,8 @@
 
 ZeroTick-Systems is a Windows C++ application that retrieves NSE market data
 from Zerodha Kite Connect, filters a configured stock universe, evaluates
-potential long entries, and optionally submits and manages MIS orders.
+potential long entries, optionally submits and manages MIS orders, and
+supports a separate historical-candle backtest mode.
 
 This document describes the event-driven runtime wired by `src/main.cpp`:
 quote delivery, stock selection, trade decisions, and trade handling.
@@ -214,12 +215,35 @@ If these checks pass, decision creates a long `TradeSignal`; it does not place
 an order. Tick size is inferred from adjacent depth prices, with `0.01` as a
 fallback. The entry trigger is one tick above the rounded-up greater of last
 price and best ask; the limit is one more tick above the trigger. Defaults set
-the target to **+0.20%** and the stop to **-0.40%** from the entry limit.
+the target to **+0.40%** and the stop to **-0.20%** from the entry limit.
 Decision attaches an indicative quantity based on a fixed 50,000 budget;
 handling recalculates quantity against the portfolio slot and may reject it.
 
 The current decision stage evaluates one fresh quote per candidate; it does
 not wait for multiple-snapshot confirmation.
+
+### Historical backtest mode
+
+`--backtest YYYY-MM-DD` downloads one-minute OHLCV candles for the configured
+NIFTY 100 symbols using Kite's historical API, then replays the available
+selection and decision rules with default capital of 10,000. The NSE
+instrument dump supplies instrument tokens and tick sizes. Trade details are
+printed as an aligned console table, followed by a summary whose final line is
+the total profit or loss.
+
+This is not a full-depth replay: candles contain no historical spread, depth,
+or five-level imbalance, so those gates are omitted. Signals are evaluated at
+bar close, entries are tested against the next one-minute bar, ambiguous
+stop/target bars assume stop-first, and remaining positions close at the end
+of the day. The next-bar entry window differs from the live 30-second timeout.
+Fees and slippage are excluded. The backtest uses the current NIFTY 100 list
+for earlier dates and may therefore have survivorship bias. Backtest mode
+cannot submit live orders.
+
+`--optimize-100-days` fetches the latest 100 completed sessions in weekly
+chunks and evaluates 20 predefined selection/exit combinations. The first 70
+sessions are used for ranking; the last 30 are reported as holdout results.
+This is a bounded diagnostic sweep, not a guarantee of profitability.
 
 ## 7. Trading modes and safety boundary
 

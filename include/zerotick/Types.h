@@ -37,6 +37,16 @@ struct MarketSnapshot {
     std::chrono::steady_clock::time_point receivedAt;
 };
 
+/** One historical OHLCV bar returned by Kite's historical candle endpoint. */
+struct HistoricalCandle {
+    std::string timestamp;
+    double open = 0.0;
+    double high = 0.0;
+    double low = 0.0;
+    double close = 0.0;
+    std::uint64_t volume = 0;
+};
+
 struct OrderResult {
     bool accepted = false;
     std::string orderId;

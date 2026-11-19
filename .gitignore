@@ -5,3 +5,6 @@
 
 # CMake build output
 /build/
+
+# Backtest and other local CSV output
+*.csv

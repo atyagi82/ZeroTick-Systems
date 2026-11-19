@@ -94,8 +94,8 @@ struct SelectionConfig {
 struct DecisionConfig {
     double minimumImbalance = 0.05;           // weighted bid-side imbalance
     double maximumSpreadPercent = 0.10;
-    double targetPercent = 0.20;              // profit target percent
-    double stopPercent = 0.40;                // stop loss percent
+    double targetPercent = 0.40;              // profit target percent
+    double stopPercent = 0.20;                // stop loss percent
     std::size_t requiredConfirmations = 1;    // snapshot confirmations
     bool requireVolumeConfirmation = true;
     double minRelativeVolume = 1.2;
