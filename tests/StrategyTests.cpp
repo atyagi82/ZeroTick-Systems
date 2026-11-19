@@ -44,11 +44,21 @@ public:
 
     void refreshQuotes(const std::vector<std::string>&) override {}
 
-    void ensureNoOpenMisExposure(const std::string&) override {}
+    void ensureNoOpenMisExposure(
+        const std::vector<std::string>&) override {}
 
     zerotick::CashAvailability cashAvailability() override {
         ++freeCashRequests_;
         return {10000.0, 0.0, 0.0, 10000.0, 0.0, 0.0, 10000.0};
+    }
+
+    double estimateMisOrderFunds(
+        const std::string&,
+        int quantity,
+        double,
+        double) override {
+        ++marginEstimateRequests_;
+        return quantity * 50.0 + 0.10;
     }
 
     zerotick::OrderResult placeStopLimitEntry(
@@ -95,6 +105,7 @@ public:
     int entryQuantity = 0;
     int exitQuantity = 0;
     int freeCashRequests_ = 0;
+    int marginEstimateRequests_ = 0;
     double entryTriggerPrice = 0.0;
     double entryLimitPrice = 0.0;
     double exitLimitPrice = 0.0;
@@ -135,7 +146,7 @@ zerotick::MarketSnapshot makeBook(double lastPrice) {
     return snapshot;
 }
 
-void testEntryNeedsThreeConfirmedSnapshots() {
+void testEntryNeedsTwoConfirmedSnapshots() {
     zerotick::OrderImbalanceStrategy strategy;
     require(
         strategy.evaluateEntry(makeBook(100.00)) ==
@@ -147,15 +158,11 @@ void testEntryNeedsThreeConfirmedSnapshots() {
         "first qualifying snapshot must not trigger an entry");
     require(
         strategy.evaluateEntry(makeBook(100.02)) ==
-            zerotick::StrategyDecision::None,
-        "second qualifying snapshot must not trigger an entry");
-    require(
-        strategy.evaluateEntry(makeBook(100.03)) ==
             zerotick::StrategyDecision::Enter,
-        "third consecutive qualifying snapshot should trigger an entry");
+        "second consecutive qualifying snapshot should trigger an entry");
     const zerotick::StrategyDiagnostics diagnostics = strategy.diagnostics();
     require(
-        diagnostics.entryTriggerPrice > 100.03 &&
+        diagnostics.entryTriggerPrice > 100.02 &&
             diagnostics.entryLimitPrice > diagnostics.entryTriggerPrice,
         "stop-limit trigger and limit should step above the current market");
 }
@@ -175,30 +182,30 @@ void testWideSpreadBlocksEntry() {
         "wide spread should be reported as the entry reason");
 }
 
-void testModeratePositiveImbalanceCanQualify() {
+void testModestPositiveImbalanceCanQualify() {
     zerotick::OrderImbalanceStrategy strategy;
     for (std::size_t level = 0; level < 5; ++level) {
         zerotick::MarketSnapshot snapshot = makeBook(100.00 + level * 0.01);
         snapshot.bidQuantity = 0;
         snapshot.askQuantity = 0;
         for (zerotick::OrderBookLevel& bid : snapshot.bidLevels) {
-            bid.quantity = 1150;
+            bid.quantity = 1110;
             snapshot.bidQuantity += bid.quantity;
         }
         for (zerotick::OrderBookLevel& ask : snapshot.askLevels) {
-            ask.quantity = 850;
+            ask.quantity = 1000;
             snapshot.askQuantity += ask.quantity;
         }
         const zerotick::StrategyDecision decision =
             strategy.evaluateEntry(snapshot);
-        if (level < 3) {
+        if (level < 2) {
             require(
                 decision == zerotick::StrategyDecision::None,
-                "moderate imbalance still needs three confirmations");
-        } else if (level == 3) {
+                "modest imbalance needs two consecutive confirmations");
+        } else if (level == 2) {
             require(
                 decision == zerotick::StrategyDecision::Enter,
-                "moderate positive imbalance should qualify after confirmation");
+                "imbalance just above +0.05 should qualify after confirmation");
         } else {
             require(
                 decision == zerotick::StrategyDecision::None,
@@ -206,8 +213,9 @@ void testModeratePositiveImbalanceCanQualify() {
         }
     }
     require(
-        strategy.diagnostics().orderImbalance > 0.10,
-        "test signal should be above the new imbalance threshold");
+        strategy.diagnostics().orderImbalance > 0.05 &&
+            strategy.diagnostics().orderImbalance < 0.06,
+        "test signal should be only slightly above the new imbalance threshold");
 }
 
 void testWeakImbalanceBlocksEntryAndResetsConfirmation() {
@@ -231,11 +239,14 @@ void testWeakImbalanceBlocksEntryAndResetsConfirmation() {
         "weak weighted imbalance should block entry");
     const zerotick::StrategyDiagnostics diagnostics = strategy.diagnostics();
     require(
-        diagnostics.orderImbalance < 0.25,
+        diagnostics.orderImbalance < 0.05,
         "weighted imbalance should reflect ask-side pressure");
     require(
         diagnostics.consecutiveConfirmations == 0,
         "failed imbalance filter must reset confirmation count");
+    require(
+        diagnostics.reason == "weighted imbalance below +0.05",
+        "below-threshold imbalance should be reported as the entry reason");
 }
 
 void testFallingPriceResetsConfirmation() {
@@ -273,13 +284,36 @@ void testTargetAndStopExits() {
         "stop exit reason should be reported");
 }
 
-void testIntradayQuantityUsesOnlyEightyPercentOfAvailableCash() {
+void testQuantityUsesFullEqualSlotBudget() {
     require(
-        zerotick::calculateIntradayQuantity(100000.0, 50.0) == 1600,
-        "quantity should use 80% of available cash, not all cash");
+        zerotick::calculateQuantityWithinBudget(1000.0, 50.10) == 19,
+        "quantity should use the MIS margin requirement within one slot");
     require(
-        zerotick::calculateIntradayQuantity(100000.0, 100000.0) == 0,
-        "insufficient cash should not produce a share quantity");
+        zerotick::calculateQuantityWithinBudget(10.0, 17.90) == 0,
+        "an equal slot below one-share margin must not produce a quantity");
+}
+
+void testPortfolioRiskManagerLimitsAndDividesSlotsEqually() {
+    zerotick::PortfolioRiskManager risk(1000.0);
+    for (int index = 0; index < 10; ++index) {
+        double slotBudget = 0.0;
+        require(
+            risk.reserveSlot(
+                "SYMBOL" + std::to_string(index), 1000.0, slotBudget),
+            "each of ten symbols should reserve one portfolio slot");
+        require(
+            std::abs(slotBudget - 100.0) < 0.0001,
+            "portfolio cash should be divided equally across ten slots");
+    }
+
+    double extraSlotBudget = 0.0;
+    require(
+        !risk.reserveSlot("EXTRA", 1000.0, extraSlotBudget),
+        "a position beyond the global ten-slot limit must be blocked");
+    risk.releaseSlot("SYMBOL0");
+    require(
+        risk.reserveSlot("EXTRA", 1000.0, extraSlotBudget),
+        "closing a position should release its portfolio slot");
 }
 
 void testFreeCashSubtractsExistingUtilization() {
@@ -303,20 +337,27 @@ void testFreeCashSubtractsExistingUtilization() {
 void testLiveWorkerSizesAndTracksStopLimitOrders() {
     std::atomic_bool stopRequested{false};
     FakeKiteApi api(stopRequested);
+    zerotick::PortfolioRiskManager portfolioRisk(10000.0);
     zerotick::Worker worker(
         "IDEA",
         api,
         std::make_unique<zerotick::OrderImbalanceStrategy>(),
         std::chrono::milliseconds(1),
         stopRequested,
-        true);
+        true,
+        portfolioRisk);
     worker.run();
 
     require(api.freeCashRequests_ == 1, "live entry should read free cash");
-    require(api.entryQuantity == 79, "entry should use no more than 80% cash");
     require(
-        std::abs(api.entryTriggerPrice - 100.04) < 0.001 &&
-            std::abs(api.entryLimitPrice - 100.05) < 0.001,
+        api.entryQuantity == 19,
+        "entry should size from one equal slot using MIS margin");
+    require(
+        api.marginEstimateRequests_ == 2,
+        "entry should verify the estimated margin for its final quantity");
+    require(
+        std::abs(api.entryTriggerPrice - 100.03) < 0.001 &&
+            std::abs(api.entryLimitPrice - 100.04) < 0.001,
         "entry should submit the strategy-derived stop-limit prices");
     require(
         api.exitQuantity == api.entryQuantity,
@@ -324,18 +365,23 @@ void testLiveWorkerSizesAndTracksStopLimitOrders() {
     require(
         std::abs(api.exitLimitPrice - 100.26) < 0.001,
         "target exit should use a tick-rounded target limit");
+    require(
+        portfolioRisk.activeReservations() == 0,
+        "a completed round trip should release its portfolio slot");
 }
 
 void testWorkerDoesNotSubmitOrdersWithoutRuntimeOptIn() {
     std::atomic_bool stopRequested{false};
     FakeKiteApi api(stopRequested, true);
+    zerotick::PortfolioRiskManager portfolioRisk(0.0);
     zerotick::Worker worker(
         "IDEA",
         api,
         std::make_unique<zerotick::OrderImbalanceStrategy>(),
         std::chrono::milliseconds(1),
         stopRequested,
-        false);
+        false,
+        portfolioRisk);
     worker.run();
 
     require(api.freeCashRequests_ == 0, "data-only mode must not check funds");
@@ -346,13 +392,15 @@ void testWorkerDoesNotSubmitOrdersWithoutRuntimeOptIn() {
 void testWorkerDoesNotCountRepeatedQuoteSnapshots() {
     std::atomic_bool stopRequested{false};
     FakeKiteApi api(stopRequested, true, false, true);
+    zerotick::PortfolioRiskManager portfolioRisk(10000.0);
     zerotick::Worker worker(
         "YESBANK",
         api,
         std::make_unique<zerotick::OrderImbalanceStrategy>(),
         std::chrono::milliseconds(1),
         stopRequested,
-        true);
+        true,
+        portfolioRisk);
     worker.run();
 
     require(
@@ -363,13 +411,15 @@ void testWorkerDoesNotCountRepeatedQuoteSnapshots() {
 void testDefinitiveKiteRejectionDoesNotLeaveUnknownPositionState() {
     std::atomic_bool stopRequested{false};
     FakeKiteApi api(stopRequested, false, true);
+    zerotick::PortfolioRiskManager portfolioRisk(10000.0);
     zerotick::Worker worker(
         "IDEA",
         api,
         std::make_unique<zerotick::OrderImbalanceStrategy>(),
         std::chrono::milliseconds(1),
         stopRequested,
-        true);
+        true,
+        portfolioRisk);
     worker.run();
 
     require(
@@ -384,13 +434,14 @@ void testDefinitiveKiteRejectionDoesNotLeaveUnknownPositionState() {
 
 int main() {
     try {
-        testEntryNeedsThreeConfirmedSnapshots();
+        testEntryNeedsTwoConfirmedSnapshots();
         testWideSpreadBlocksEntry();
-        testModeratePositiveImbalanceCanQualify();
+        testModestPositiveImbalanceCanQualify();
         testWeakImbalanceBlocksEntryAndResetsConfirmation();
         testFallingPriceResetsConfirmation();
         testTargetAndStopExits();
-        testIntradayQuantityUsesOnlyEightyPercentOfAvailableCash();
+        testQuantityUsesFullEqualSlotBudget();
+        testPortfolioRiskManagerLimitsAndDividesSlotsEqually();
         testFreeCashSubtractsExistingUtilization();
         testLiveWorkerSizesAndTracksStopLimitOrders();
         testWorkerDoesNotSubmitOrdersWithoutRuntimeOptIn();

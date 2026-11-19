@@ -101,7 +101,7 @@ StrategyDecision OrderImbalanceStrategy::evaluateEntry(
         lastDecisionReason_ = "spread exceeds 0.10% limit";
     } else if (orderImbalance_ < minimumImbalance_) {
         consecutiveConfirmations_ = 0;
-        lastDecisionReason_ = "weighted imbalance below +0.10";
+        lastDecisionReason_ = "weighted imbalance below +0.05";
     } else if (!hasPreviousPrice) {
         consecutiveConfirmations_ = 0;
         lastDecisionReason_ = "waiting for price confirmation";
@@ -127,7 +127,8 @@ StrategyDecision OrderImbalanceStrategy::evaluateEntry(
         if (consecutiveConfirmations_ < requiredConfirmations_) {
             lastDecisionReason_ =
                 "imbalance confirmation " +
-                std::to_string(consecutiveConfirmations_) + "/3";
+                std::to_string(consecutiveConfirmations_) + "/" +
+                std::to_string(requiredConfirmations_);
         } else {
             lastDecisionReason_ =
                 "entry signal already issued for this confirmation run";

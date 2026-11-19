@@ -32,8 +32,14 @@ public:
 
     virtual MarketSnapshot getQuote(const std::string& symbol) = 0;
     virtual void refreshQuotes(const std::vector<std::string>& symbols) = 0;
-    virtual void ensureNoOpenMisExposure(const std::string& symbol) = 0;
+    virtual void ensureNoOpenMisExposure(
+        const std::vector<std::string>& symbols) = 0;
     virtual CashAvailability cashAvailability() = 0;
+    virtual double estimateMisOrderFunds(
+        const std::string& symbol,
+        int quantity,
+        double triggerPrice,
+        double limitPrice) = 0;
     virtual OrderResult placeStopLimitEntry(
         const std::string& symbol,
         int quantity,
@@ -59,8 +65,14 @@ public:
 
     MarketSnapshot getQuote(const std::string& symbol) override;
     void refreshQuotes(const std::vector<std::string>& symbols) override;
-    void ensureNoOpenMisExposure(const std::string& symbol) override;
+    void ensureNoOpenMisExposure(
+        const std::vector<std::string>& symbols) override;
     CashAvailability cashAvailability() override;
+    double estimateMisOrderFunds(
+        const std::string& symbol,
+        int quantity,
+        double triggerPrice,
+        double limitPrice) override;
     OrderResult placeStopLimitEntry(
         const std::string& symbol,
         int quantity,

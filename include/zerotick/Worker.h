@@ -1,6 +1,7 @@
 #pragma once
 
 #include "KiteApi.h"
+#include "Risk.h"
 #include "StateMachine.h"
 #include "Strategy.h"
 
@@ -26,7 +27,8 @@ public:
         std::unique_ptr<Strategy> strategy,
         std::chrono::milliseconds pollInterval,
         std::atomic_bool& stopRequested,
-        bool liveTrading);
+        bool liveTrading,
+        PortfolioRiskManager& portfolioRisk);
 
     void run();
     WorkerState state() const;
@@ -49,6 +51,7 @@ private:
     std::chrono::milliseconds pollInterval_;
     std::atomic_bool& stopRequested_;
     bool liveTrading_;
+    PortfolioRiskManager& portfolioRisk_;
 
     mutable std::mutex stateMutex_;
     WorkerStateMachine stateMachine_;

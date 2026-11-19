@@ -10,11 +10,13 @@ ThreadPool::ThreadPool(
     KiteApi& api,
     const std::vector<std::string>& symbols,
     std::chrono::milliseconds pollInterval,
-    bool liveTrading)
+    bool liveTrading,
+    double totalAvailableCash)
     : api_(api),
       symbols_(symbols),
       pollInterval_(pollInterval),
-      liveTrading_(liveTrading) {
+      liveTrading_(liveTrading),
+      portfolioRisk_(totalAvailableCash) {
     if (symbols_.size() != kWorkerCount) {
         throw std::invalid_argument(
             "ThreadPool requires exactly 20 symbols");
@@ -33,8 +35,7 @@ void ThreadPool::start() {
     stopRequested_.store(false);
     threads_.reserve(kActiveWorkerCount);
 
-    // Keep the 20-symbol quote universe loaded, but only run the first
-    // configured stock worker during the current live-data validation.
+    // Each configured symbol has one independent worker.
     for (std::size_t index = 0; index < kActiveWorkerCount; ++index) {
         const std::string symbol = symbols_[index];
         threads_.emplace_back([this, symbol] {
@@ -44,7 +45,8 @@ void ThreadPool::start() {
                 std::make_unique<OrderImbalanceStrategy>(),
                 pollInterval_,
                 stopRequested_,
-                liveTrading_);
+                liveTrading_,
+                portfolioRisk_);
             worker.run();
         });
     }
@@ -52,9 +54,7 @@ void ThreadPool::start() {
     logLine(
         "Started " + std::to_string(kActiveWorkerCount) + " of " +
         std::to_string(kWorkerCount) + " stock worker threads; " +
-        std::to_string(kWorkerCount - kActiveWorkerCount) +
-        " disabled; active_symbol=" + symbols_.front() +
-        " live_trading=" + (liveTrading_ ? "enabled" : "disabled"));
+        "live_trading=" + (liveTrading_ ? "enabled" : "disabled"));
 }
 
 void ThreadPool::stop() {

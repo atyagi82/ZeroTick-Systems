@@ -70,13 +70,15 @@ Worker::Worker(
     std::unique_ptr<Strategy> strategy,
     std::chrono::milliseconds pollInterval,
     std::atomic_bool& stopRequested,
-    bool liveTrading)
+    bool liveTrading,
+    PortfolioRiskManager& portfolioRisk)
     : symbol_(std::move(symbol)),
       api_(api),
       strategy_(std::move(strategy)),
       pollInterval_(pollInterval),
       stopRequested_(stopRequested),
-      liveTrading_(liveTrading) {}
+      liveTrading_(liveTrading),
+      portfolioRisk_(portfolioRisk) {}
 
 void Worker::run() {
     start();
@@ -174,27 +176,109 @@ void Worker::handleEntry() {
         return;
     }
 
+    std::lock_guard<std::mutex> entryLock(
+        portfolioRisk_.entryWorkflowMutex());
+    if (portfolioRisk_.activeReservations() >=
+        kMaximumLivePositions) {
+        stateMachine_.transition(WorkerEvent::EntrySignal);
+        stateMachine_.transition(WorkerEvent::EntryRejected);
+        logLine(
+            "[worker] symbol=" + symbol_ +
+            " order=not_submitted reason=\"global live-position limit "
+            "reached\" active_positions=" +
+            std::to_string(portfolioRisk_.activeReservations()));
+        return;
+    }
+
     stateMachine_.transition(WorkerEvent::EntrySignal);
     const CashAvailability funds = api_.cashAvailability();
-    const double cash = funds.freeCash;
-    quantity_ =
-        calculateIntradayQuantity(cash, diagnostics.entryLimitPrice);
-    if (quantity_ <= 0) {
+    double slotBudget = 0.0;
+    if (!portfolioRisk_.reserveSlot(
+            symbol_, funds.freeCash, slotBudget)) {
+        stateMachine_.transition(WorkerEvent::EntryRejected);
+        logLine(
+            "[worker] symbol=" + symbol_ +
+            " order=not_submitted reason=\"global live-position limit "
+            "reached or symbol already reserved\" active_positions=" +
+            std::to_string(portfolioRisk_.activeReservations()));
+        return;
+    }
+
+    double oneShareMargin = 0.0;
+    double estimatedOrderFunds = 0.0;
+    try {
+        oneShareMargin = api_.estimateMisOrderFunds(
+            symbol_,
+            1,
+            diagnostics.entryTriggerPrice,
+            diagnostics.entryLimitPrice);
+        if (!std::isfinite(oneShareMargin) || oneShareMargin <= 0.0) {
+            throw std::runtime_error(
+                "Kite returned an invalid one-share MIS margin estimate");
+        }
+        quantity_ =
+            calculateQuantityWithinBudget(slotBudget, oneShareMargin);
+        if (quantity_ > 0) {
+            estimatedOrderFunds = quantity_ == 1
+                ? oneShareMargin
+                : api_.estimateMisOrderFunds(
+                    symbol_,
+                    quantity_,
+                    diagnostics.entryTriggerPrice,
+                    diagnostics.entryLimitPrice);
+            if (!std::isfinite(estimatedOrderFunds) ||
+                estimatedOrderFunds <= 0.0) {
+                throw std::runtime_error(
+                    "Kite returned an invalid MIS margin estimate");
+            }
+            for (std::size_t attempt = 0;
+                 estimatedOrderFunds > slotBudget && attempt < 8;
+                 ++attempt) {
+                int adjustedQuantity = calculateQuantityWithinBudget(
+                    slotBudget,
+                    estimatedOrderFunds / quantity_);
+                if (adjustedQuantity >= quantity_) {
+                    adjustedQuantity = quantity_ - 1;
+                }
+                quantity_ = adjustedQuantity;
+                if (quantity_ <= 0) {
+                    break;
+                }
+                estimatedOrderFunds = api_.estimateMisOrderFunds(
+                    symbol_,
+                    quantity_,
+                    diagnostics.entryTriggerPrice,
+                    diagnostics.entryLimitPrice);
+                if (!std::isfinite(estimatedOrderFunds) ||
+                    estimatedOrderFunds <= 0.0) {
+                    throw std::runtime_error(
+                        "Kite returned an invalid MIS margin estimate");
+                }
+            }
+        }
+    } catch (const std::exception& exception) {
         quantity_ = 0;
+        portfolioRisk_.releaseSlot(symbol_);
+        stateMachine_.transition(WorkerEvent::EntryRejected);
+        logLine(
+            "[worker] symbol=" + symbol_ +
+            " order=not_submitted reason=\"MIS margin estimate failed: " +
+            exception.what() + '"');
+        return;
+    }
+
+    if (quantity_ <= 0 || estimatedOrderFunds > slotBudget) {
+        quantity_ = 0;
+        portfolioRisk_.releaseSlot(symbol_);
         stateMachine_.transition(WorkerEvent::EntryRejected);
         std::ostringstream message;
         message << std::fixed << std::setprecision(2)
                 << "[worker] symbol=" << symbol_
-                << " order=not_submitted reason=\"free cash below one-share "
-                   "minimum\" raw_cash=" << funds.rawCash
-                << " intraday_payin=" << funds.intradayPayin
-                << " adhoc_margin=" << funds.adhocMargin
-                << " live_balance=" << funds.liveBalance
-                << " utilized_debits=" << funds.utilizedDebits
-                << " collateral=" << funds.collateral
-                << " free_cash=" << cash
-                << " required_free_cash="
-                << diagnostics.entryLimitPrice / kMaximumCashUtilization
+                << " order=not_submitted reason=\"equal portfolio slot "
+                   "cannot cover one MIS share\" free_cash="
+                << funds.freeCash
+                << " slot_budget=" << slotBudget
+                << " one_share_margin_and_charges=" << oneShareMargin
                 << " entry_limit=" << diagnostics.entryLimitPrice;
         logLine(message.str());
         return;
@@ -211,6 +295,7 @@ void Worker::handleEntry() {
         if (exception.statusCode() >= 400 &&
             exception.statusCode() < 500) {
             quantity_ = 0;
+            portfolioRisk_.releaseSlot(symbol_);
             stateMachine_.transition(WorkerEvent::EntryRejected);
             logLine("[worker] symbol=" + symbol_ +
                     " order=rejected http_status=" +
@@ -222,6 +307,7 @@ void Worker::handleEntry() {
     }
     if (!order.accepted || order.orderId.empty()) {
         quantity_ = 0;
+        portfolioRisk_.releaseSlot(symbol_);
         stateMachine_.transition(WorkerEvent::EntryRejected);
         logLine("[worker] symbol=" + symbol_ +
                 " order=not_submitted reason=\"" + order.message + '"');
@@ -234,9 +320,10 @@ void Worker::handleEntry() {
     logLine("[worker] symbol=" + symbol_ +
             " order=stop_limit_submitted order_id=" + entryOrderId_ +
             " quantity=" + std::to_string(quantity_) +
-            " free_cash=" + std::to_string(cash) +
-            " cash_budget=" +
-            std::to_string(cash * kMaximumCashUtilization) +
+            " free_cash=" + std::to_string(funds.freeCash) +
+            " equal_slot_budget=" + std::to_string(slotBudget) +
+            " estimated_mis_funds=" +
+            std::to_string(estimatedOrderFunds) +
             " estimated_notional=" +
             std::to_string(
                 quantity_ * diagnostics.entryLimitPrice) +
@@ -261,7 +348,12 @@ void Worker::handleEntryPending() {
                     " quantity=" + std::to_string(quantity_) +
                     " average_price=" + std::to_string(entryPrice_));
         } else {
+            if (status.filledQuantity > 0) {
+                throw std::runtime_error(
+                    "Kite reported an entry fill without a valid average price");
+            }
             quantity_ = 0;
+            portfolioRisk_.releaseSlot(symbol_);
             stateMachine_.transition(WorkerEvent::EntryRejected);
             logLine("[worker] symbol=" + symbol_ +
                     " entry=not_filled status=" + status.status);
@@ -376,6 +468,7 @@ void Worker::handleExitPending() {
 
         if (quantity_ == 0) {
             entryPrice_ = 0.0;
+            portfolioRisk_.releaseSlot(symbol_);
             stateMachine_.transition(WorkerEvent::ExitCompleted);
             logLine("[worker] symbol=" + symbol_ +
                     " position=closed state=" +

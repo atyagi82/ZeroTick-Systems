@@ -57,11 +57,11 @@ private:
         1.0, 0.8, 0.6, 0.4, 0.2
     };
 
-    double minimumImbalance_ = 0.10;
+    double minimumImbalance_ = 0.05;
     double maximumSpreadPercent_ = 0.10;
     double targetPercent_ = 0.20;
     double stopPercent_ = 0.40;
-    std::size_t requiredConfirmations_ = 3;
+    std::size_t requiredConfirmations_ = 2;
     std::size_t consecutiveConfirmations_ = 0;
     double orderImbalance_ = 0.0;
     double spreadPercent_ = 0.0;

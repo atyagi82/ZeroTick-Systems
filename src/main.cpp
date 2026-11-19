@@ -23,7 +23,7 @@ void handleSignal(int) {
 } // namespace
 
 int main(int argumentCount, char* arguments[]) {
-    // Keep the 20-symbol quote watchlist; only YESBANK has an active worker.
+    // Keep the existing 20-symbol watchlist; each symbol gets one worker.
     const std::vector<std::string> symbols = {
         "YESBANK", "HDFCBANK", "ICICIBANK", "INFY", "BHARTIARTL",
         "TCS", "SBIN", "ITC", "LT", "AXISBANK",
@@ -53,17 +53,31 @@ int main(int argumentCount, char* arguments[]) {
         // local credentials are missing, expired, or rejected by Kite.
         zerotick::KiteConnectApi kiteApi(forceLogin);
         kiteApi.refreshQuotes(symbols);
+        double totalAvailableCash = 0.0;
         if (liveTrading) {
-            kiteApi.ensureNoOpenMisExposure(symbols.front());
+            kiteApi.ensureNoOpenMisExposure(symbols);
+            totalAvailableCash = kiteApi.cashAvailability().freeCash;
             zerotick::logLine(
-                "[kite] live_trading=enabled symbol=" + symbols.front() +
-                " max_cash_utilization_pct=80 product=MIS");
+                "[kite] live_trading=enabled symbols=" +
+                std::to_string(symbols.size()) +
+                " portfolio_cash_budget=" +
+                std::to_string(totalAvailableCash) +
+                " equal_slot_budget=" +
+                std::to_string(
+                    totalAvailableCash / zerotick::kMaximumLivePositions) +
+                " max_open_positions=" +
+                std::to_string(zerotick::kMaximumLivePositions) +
+                " product=MIS");
         }
         zerotick::logLine(
             "[kite] quote_batch=received instruments=" +
             std::to_string(symbols.size()));
         zerotick::ThreadPool pool(
-            kiteApi, symbols, std::chrono::seconds(1), liveTrading);
+            kiteApi,
+            symbols,
+            std::chrono::seconds(1),
+            liveTrading,
+            totalAvailableCash);
         pool.start();
 
         // Fetch one batched quote response per second, not 20 concurrent

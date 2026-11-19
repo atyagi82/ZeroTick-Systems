@@ -2,7 +2,7 @@
 
 ZeroTick-Systems is a C++ algorithmic trading platform being developed using Zerodha's Kite developer APIs. The project aims to support fast, data-driven trading strategies and execution that seek small but frequent opportunities while maintaining strict risk controls.
 
-> **Status:** Prototype. Kite Connect login, batched quote retrieval, worker status reporting, and focused strategy unit tests have been exercised locally. Live MIS order submission is available only with an explicit runtime flag, is off by default, and has not been validated with a broker order. Market-hours validation and production risk controls remain pending.
+> **Status:** Prototype. Kite Connect login, batched quote retrieval, and focused strategy tests have been exercised locally. A YESBANK MIS entry fill has been observed, but complete exit handling and multi-symbol live operation have not been validated. Live MIS orders remain behind an explicit runtime flag. Production risk controls remain pending.
 
 ## Current status and validation
 
@@ -12,13 +12,13 @@ Validated locally on 2026-11-19:
 - The Kite quote endpoint returned a batch for all 20 configured instruments.
 - All 20 workers started and printed market snapshots, depth totals, indicator values, and `NO_ENTRY` reasons.
 - The C++ application built successfully with Visual Studio 2022 and CMake.
-- The latest Release build and CTest run passed, including simulated order-fill, exit, cash-sizing, and opt-in checks. No real order was submitted.
+- The initial Release build and CTest run passed, including simulated order-fill, exit, cash-sizing, and opt-in checks. No real order was submitted during that initial validation.
 
-This run was outside market hours. The returned snapshots showed one-sided or unavailable book levels and repeated prices; this confirms API retrieval, not live, actionable order-book depth. No entry signal fired and no orders were placed. A market-hours validation and paper-trading/backtest evaluation remain necessary.
+That initial run was outside market hours. The returned snapshots showed one-sided or unavailable book levels and repeated prices; this confirms API retrieval, not live, actionable order-book depth. No entry signal fired and no orders were placed during that run. A market-hours validation and paper-trading/backtest evaluation remain necessary.
 
 ### Current live-data test mode
 
-Only one of the 20 stock worker threads is enabled: the first configured symbol, `YESBANK`. The other 19 stock workers are disabled. The quote poller fetches the configured 20-symbol batch once per second, while only the `YESBANK` worker evaluates and logs strategy signals on fresh snapshots. Orders are not sent unless `--enable-live-trading` is explicitly supplied.
+All 20 configured symbols have an active worker, with one worker per symbol. The quote poller fetches their quotes in one batch once per second. Without `--enable-live-trading`, workers only evaluate and log signals. With live mode, a shared portfolio guard allows at most 10 pending/open strategy positions and allocates the startup free-cash budget evenly across those 10 slots.
 
 ## Project goals
 
@@ -89,7 +89,7 @@ To force a fresh Kite login and token exchange:
 
 The app opens the login URL in your browser and listens only on `127.0.0.1:8765` for the configured `/callback`. After you sign in, it captures the one-time request token locally, exchanges it for an access token, and stores the access token in `.env` without printing either token. Configure the Kite app redirect URL as `http://127.0.0.1:8765/callback`. A Kite API key by itself cannot create an access token; the browser login step is required.
 
-The executable authenticates with Kite Connect and fetches the 20-symbol quote/depth batch once per second. Only the `YESBANK` worker processes fresh snapshots; the other 19 stock workers are disabled. Without the live-trading flag, it only evaluates and logs signals. Repeated reads of the same cached snapshot do not count as additional strategy confirmations.
+The executable authenticates with Kite Connect and fetches the 20-symbol quote/depth batch once per second. All 20 workers process fresh snapshots from that shared cache. Without the live-trading flag, they only evaluate and log signals. Repeated reads of the same cached snapshot do not count as additional strategy confirmations.
 
 The active worker writes a synchronized status line showing symbol, last price, best bid/ask, five-level depth totals, weighted imbalance, spread, price change, entry trigger/limit, confirmation count, quote age, signal, and the first unmet entry/exit condition. Live-order logs also show quantity, free cash, and estimated notional. Expect roughly one strategy status line per one-second quote refresh; quote/API failures are also logged.
 
@@ -118,10 +118,10 @@ Idle -> Monitoring -> EntryPending -> PositionOpen -> ExitPending -> Cooldown ->
 For Kite's five bid and ask levels, the strategy applies weights `1.0, 0.8, 0.6, 0.4, 0.2`, giving nearer liquidity more influence. It enters only when:
 
 - Both sides of the order book are available and valid.
-- Weighted imbalance `(weighted bids - weighted asks) / (weighted bids + weighted asks)` is at least `+0.10`. This threshold was lowered after the IDEA sample remained below `+0.18`; the spread, non-falling price, and three-snapshot confirmations remain in place.
+- Weighted imbalance `(weighted bids - weighted asks) / (weighted bids + weighted asks)` is at least `+0.05`.
 - The best bid/ask spread is no more than `0.10%` of the midpoint.
 - Last traded price is not lower than the previous quote snapshot.
-- All conditions hold for three consecutive fresh snapshots, approximately one second apart.
+- All conditions hold for two consecutive fresh snapshots, approximately one second apart.
 
 It exits at a `+0.20%` price move from entry or a `-0.40%` move. Before fees and slippage, that target/stop ratio requires a win rate above approximately `66.7%` to break even. This is not a forecast; success probability must be measured using historical order-book data and realistic transaction costs.
 
@@ -130,13 +130,13 @@ It exits at a `+0.20%` price move from entry or a `-0.40%` move. Before fees and
 Live mode is disabled by default. With `--enable-live-trading`, the app:
 
 - Requires the machine's outbound static IP to be configured as an allowed IP for the Kite app; otherwise Kite rejects order requests.
-- Refuses startup if Kite reports an existing YESBANK MIS position or open YESBANK MIS order.
+- Refuses startup if Kite reports an existing MIS position or open MIS order for any of the 20 configured symbols.
 - Uses a Kite `SL` buy order with its trigger one observed price tick above the greater of last price and best ask; its limit is one more tick above the trigger. Tick size is inferred from adjacent depth levels, normalized to paise, with `0.01` as fallback.
-- Sizes quantity as `floor(80% * free cash / entry limit price)`, where free cash is the lower of Kite's current live balance and raw cash plus intraday payin less utilized debits. It does not use pledged collateral, ad-hoc margin, or leveraged MIS buying power; fees and price movement can still affect actual requirements.
+- Reads Kite's free cash at startup and divides it into 10 equal position-slot budgets. For each entry, it asks Kite's `/margins/orders` endpoint for the estimated MIS margin and charges, using the leverage Kite currently allows for that order; quantity is reduced until the estimate fits the symbol's slot. At most 10 pending/open entries can hold slots at once. The estimate can differ from the final broker requirement, and the 100% allocation leaves no extra fee or price-movement buffer.
 - Polls broker order status, uses the reported fill quantity and average price, and requests entry cancellation after 30 seconds if still pending.
 - Monitors the target/stop in the running process, then submits a MIS limit sell. Target exits use the target price; stop exits use the current best bid. Unfilled exits are canceled and repriced after five seconds.
 
-**Important:** the target and stop are monitored by this application, not protected by a broker-hosted OCO/bracket order. Quote polling and in-process exit handling can still delay reactions; a limit stop exit may not fill during a fast move, and a crash, network failure, or shutdown can leave a position/order open. Keep the process running and independently verify orders and positions in Kite. Live order handling has only been build-tested, not validated with real broker orders; use paper trading and confirm behavior before considering live use.
+**Important:** the target and stop are monitored by this application, not protected by a broker-hosted OCO/bracket order. Quote polling and in-process exit handling can delay reactions; a limit stop exit may not fill during a fast move, and a crash, network failure, or shutdown can leave a position/order open. Enabling `--enable-live-trading` now permits any of the 20 workers to submit orders, subject to the 10-slot portfolio guard. Keep the process running and independently verify orders and positions in Kite. Multi-symbol live behavior and the portfolio guard have not been validated with real broker orders; use paper trading and confirm behavior before considering live use.
 
 
 ## 19th November First Testing

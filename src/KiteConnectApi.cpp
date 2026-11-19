@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -460,7 +461,8 @@ std::string httpRequest(
     const std::wstring& path,
     const std::string& body,
     const std::string& apiKey,
-    const std::string& accessToken) {
+    const std::string& accessToken,
+    bool jsonBody = false) {
     WinHttpHandle session(WinHttpOpen(
         L"ZeroTick-Systems/0.1",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -495,7 +497,9 @@ std::string httpRequest(
         headers += L"\r\n";
     }
     if (std::wstring(method) == L"POST") {
-        headers += L"Content-Type: application/x-www-form-urlencoded\r\n";
+        headers += jsonBody
+            ? L"Content-Type: application/json\r\n"
+            : L"Content-Type: application/x-www-form-urlencoded\r\n";
     }
 
     const LPVOID requestBody = body.empty()
@@ -745,7 +749,13 @@ void KiteConnectApi::refreshQuotes(
     quotes_.swap(updated);
 }
 
-void KiteConnectApi::ensureNoOpenMisExposure(const std::string& symbol) {
+void KiteConnectApi::ensureNoOpenMisExposure(
+    const std::vector<std::string>& symbols) {
+    if (symbols.empty()) {
+        throw std::invalid_argument(
+            "MIS exposure preflight needs at least one symbol");
+    }
+
     const std::string positionsResponse = httpRequest(
         "Kite positions preflight",
         L"GET", L"/portfolio/positions", std::string(),
@@ -757,7 +767,10 @@ void KiteConnectApi::ensureNoOpenMisExposure(const std::string& symbol) {
 
     const json& netPositions = positions.at("data").at("net");
     for (const json& position : netPositions) {
-        if (position.value("tradingsymbol", std::string()) == symbol &&
+        const std::string symbol =
+            position.value("tradingsymbol", std::string());
+        if (std::find(symbols.begin(), symbols.end(), symbol) !=
+                symbols.end() &&
             position.value("product", std::string()) == "MIS" &&
             position.value("quantity", 0) != 0) {
             throw std::runtime_error(
@@ -779,8 +792,11 @@ void KiteConnectApi::ensureNoOpenMisExposure(const std::string& symbol) {
             status == "COMPLETE" ||
             status == "REJECTED" ||
             status == "CANCELLED";
+        const std::string symbol =
+            order.value("tradingsymbol", std::string());
         if (!terminal &&
-            order.value("tradingsymbol", std::string()) == symbol &&
+            std::find(symbols.begin(), symbols.end(), symbol) !=
+                symbols.end() &&
             order.value("product", std::string()) == "MIS") {
             throw std::runtime_error(
                 "Live trading blocked: an open MIS order already exists for " +
@@ -821,6 +837,56 @@ CashAvailability KiteConnectApi::cashAvailability() {
         collateral,
         calculateFreeCash(cash, intradayPayin, utilized, liveBalance)
     };
+}
+
+double KiteConnectApi::estimateMisOrderFunds(
+    const std::string& symbol,
+    int quantity,
+    double triggerPrice,
+    double limitPrice) {
+    if (symbol.empty() || quantity <= 0 ||
+        triggerPrice <= 0.0 || limitPrice < triggerPrice) {
+        throw std::invalid_argument(
+            "Invalid MIS margin-estimate parameters");
+    }
+
+    json order = {
+        {"exchange", "NSE"},
+        {"tradingsymbol", symbol},
+        {"transaction_type", "BUY"},
+        {"variety", "regular"},
+        {"product", "MIS"},
+        {"order_type", "SL"},
+        {"quantity", quantity},
+        {"price", limitPrice},
+        {"trigger_price", triggerPrice}
+    };
+    const json body = json::array({order});
+    const std::string response = httpRequest(
+        "Kite MIS order margin estimate",
+        L"POST", L"/margins/orders", body.dump(),
+        apiKey_, accessToken_, true);
+    const json result = json::parse(response);
+    if (result.value("status", std::string()) != "success") {
+        throw std::runtime_error(
+            "Kite MIS margin estimate did not succeed");
+    }
+
+    const json& margins = result.at("data");
+    if (!margins.is_array() || margins.size() != 1) {
+        throw std::runtime_error(
+            "Kite returned an invalid MIS margin estimate");
+    }
+    const json& margin = margins.at(0);
+    const double requiredMargin = margin.at("total").get<double>();
+    const double estimatedCharges =
+        margin.at("charges").at("total").get<double>();
+    const double totalRequired = requiredMargin + estimatedCharges;
+    if (!std::isfinite(totalRequired) || totalRequired <= 0.0) {
+        throw std::runtime_error(
+            "Kite returned an invalid MIS margin or charge estimate");
+    }
+    return totalRequired;
 }
 
 OrderResult KiteConnectApi::placeStopLimitEntry(

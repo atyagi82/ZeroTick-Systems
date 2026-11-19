@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Worker.h"
+#include "Risk.h"
 
 #include <atomic>
 #include <chrono>
@@ -12,7 +13,7 @@
 namespace zerotick {
 
 constexpr std::size_t kWorkerCount = 20;
-constexpr std::size_t kActiveWorkerCount = 1;
+constexpr std::size_t kActiveWorkerCount = kWorkerCount;
 
 /**
  * Fixed-size thread pool where one thread is permanently associated with one
@@ -27,7 +28,8 @@ public:
         KiteApi& api,
         const std::vector<std::string>& symbols,
         std::chrono::milliseconds pollInterval,
-        bool liveTrading);
+        bool liveTrading,
+        double totalAvailableCash);
 
     ~ThreadPool();
 
@@ -42,6 +44,7 @@ private:
     std::vector<std::string> symbols_;
     std::chrono::milliseconds pollInterval_;
     bool liveTrading_;
+    PortfolioRiskManager portfolioRisk_;
     std::atomic_bool stopRequested_{false};
     std::vector<std::thread> threads_;
 };
