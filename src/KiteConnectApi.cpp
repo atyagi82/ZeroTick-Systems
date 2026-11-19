@@ -613,13 +613,25 @@ MarketSnapshot parseQuote(
     if (!sells.empty()) {
         snapshot.askPrice = sells.at(0).at("price").get<double>();
     }
-    // Sum displayed quantities across all returned levels to produce a
-    // multi-level book imbalance rather than relying only on the best level.
-    for (const json& level : buys) {
-        snapshot.bidQuantity += level.at("quantity").get<std::uint64_t>();
+    // Retain every returned level so the strategy can weight near-touch
+    // liquidity more strongly than depth farther from the best prices.
+    for (std::size_t index = 0;
+         index < buys.size() && index < snapshot.bidLevels.size();
+         ++index) {
+        snapshot.bidLevels[index].price =
+            buys.at(index).at("price").get<double>();
+        snapshot.bidLevels[index].quantity =
+            buys.at(index).at("quantity").get<std::uint64_t>();
+        snapshot.bidQuantity += snapshot.bidLevels[index].quantity;
     }
-    for (const json& level : sells) {
-        snapshot.askQuantity += level.at("quantity").get<std::uint64_t>();
+    for (std::size_t index = 0;
+         index < sells.size() && index < snapshot.askLevels.size();
+         ++index) {
+        snapshot.askLevels[index].price =
+            sells.at(index).at("price").get<double>();
+        snapshot.askLevels[index].quantity =
+            sells.at(index).at("quantity").get<std::uint64_t>();
+        snapshot.askQuantity += snapshot.askLevels[index].quantity;
     }
     return snapshot;
 }

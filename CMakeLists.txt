@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(ZeroTickSystems LANGUAGES CXX)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -34,3 +35,9 @@ target_link_libraries(
 
 add_executable(zerotick src/main.cpp)
 target_link_libraries(zerotick PRIVATE zerotick_core)
+
+if(BUILD_TESTING)
+    add_executable(strategy_tests tests/StrategyTests.cpp)
+    target_link_libraries(strategy_tests PRIVATE zerotick_core)
+    add_test(NAME strategy_tests COMMAND strategy_tests)
+endif()

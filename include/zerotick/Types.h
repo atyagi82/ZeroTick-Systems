@@ -2,9 +2,15 @@
 
 #include <cstdint>
 #include <chrono>
+#include <array>
 #include <string>
 
 namespace zerotick {
+
+struct OrderBookLevel {
+    double price = 0.0;
+    std::uint64_t quantity = 0;
+};
 
 /**
  * Market snapshot returned by a broker or market-data provider.
@@ -17,8 +23,10 @@ struct MarketSnapshot {
     double lastPrice = 0.0;
     double bidPrice = 0.0;
     double askPrice = 0.0;
-    // Top-level order-book quantities.  These are required to calculate
-    // order-depth imbalance: positive means bid demand, negative means ask supply.
+    // Five levels from the exchange response; quantities below also retain
+    // the total displayed quantity for logs and basic liquidity checks.
+    std::array<OrderBookLevel, 5> bidLevels{};
+    std::array<OrderBookLevel, 5> askLevels{};
     std::uint64_t bidQuantity = 0;
     std::uint64_t askQuantity = 0;
     std::uint64_t sequence = 0;

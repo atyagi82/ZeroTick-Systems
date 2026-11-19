@@ -12,6 +12,7 @@
 namespace zerotick {
 
 constexpr std::size_t kWorkerCount = 20;
+constexpr std::size_t kActiveWorkerCount = 1;
 
 /**
  * Fixed-size thread pool where one thread is permanently associated with one

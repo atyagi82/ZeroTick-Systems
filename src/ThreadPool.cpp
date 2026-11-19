@@ -1,7 +1,7 @@
 #include "zerotick/ThreadPool.h"
+#include "zerotick/Log.h"
 #include "zerotick/Strategy.h"
 
-#include <iostream>
 #include <stdexcept>
 
 namespace zerotick {
@@ -29,23 +29,28 @@ void ThreadPool::start() {
     }
 
     stopRequested_.store(false);
-    threads_.reserve(kWorkerCount);
+    threads_.reserve(kActiveWorkerCount);
 
-    for (const std::string& symbol : symbols_) {
-        // Each thread owns one independent worker and never migrates symbols.
+    // Keep the 20-symbol quote universe loaded, but only run the first
+    // configured stock worker during the current live-data validation.
+    for (std::size_t index = 0; index < kActiveWorkerCount; ++index) {
+        const std::string symbol = symbols_[index];
         threads_.emplace_back([this, symbol] {
             Worker worker(
                 symbol,
                 api_,
-                std::make_unique<CombinedStrategy>(),
+                std::make_unique<OrderImbalanceStrategy>(),
                 pollInterval_,
                 stopRequested_);
             worker.run();
         });
     }
 
-    std::cout << "Started " << kWorkerCount
-              << " stock worker threads\n";
+    logLine(
+        "Started " + std::to_string(kActiveWorkerCount) + " of " +
+        std::to_string(kWorkerCount) + " stock worker threads; " +
+        std::to_string(kWorkerCount - kActiveWorkerCount) +
+        " disabled; active_symbol=" + symbols_.front());
 }
 
 void ThreadPool::stop() {

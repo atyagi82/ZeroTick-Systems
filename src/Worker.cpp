@@ -26,13 +26,12 @@ void logMarketStatus(
          << " ask=" << snapshot.askPrice
          << " bid_depth_qty=" << snapshot.bidQuantity
          << " ask_depth_qty=" << snapshot.askQuantity
-         << " imbalance=" << std::setprecision(3)
+         << " weighted_imbalance=" << std::setprecision(3)
          << indicators.orderImbalance
-         << " ema_fast=" << std::setprecision(2) << indicators.fastEma
-         << " ema_slow=" << indicators.slowEma
-         << " rsi=" << indicators.rsi
-         << " indicators_ready="
-         << (indicators.indicatorsReady ? "yes" : "no")
+         << " spread_pct=" << std::setprecision(3)
+         << indicators.spreadPercent
+         << " price_change_pct=" << indicators.priceChangePercent
+         << " confirmations=" << indicators.consecutiveConfirmations
          << " signal=" << decision
          << " reason=\"" << indicators.reason << '"'
          << " quote_age_ms=" << quoteAgeMs;
