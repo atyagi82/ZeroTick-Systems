@@ -16,6 +16,9 @@ struct StrategyDiagnostics {
     double orderImbalance = 0.0;
     double spreadPercent = 0.0;
     double priceChangePercent = 0.0;
+    double entryTriggerPrice = 0.0;
+    double entryLimitPrice = 0.0;
+    bool stopLossTriggered = false;
     std::size_t consecutiveConfirmations = 0;
     std::string reason;
 };
@@ -54,7 +57,7 @@ private:
         1.0, 0.8, 0.6, 0.4, 0.2
     };
 
-    double minimumImbalance_ = 0.25;
+    double minimumImbalance_ = 0.10;
     double maximumSpreadPercent_ = 0.10;
     double targetPercent_ = 0.20;
     double stopPercent_ = 0.40;
@@ -63,6 +66,9 @@ private:
     double orderImbalance_ = 0.0;
     double spreadPercent_ = 0.0;
     double priceChangePercent_ = 0.0;
+    double entryTriggerPrice_ = 0.0;
+    double entryLimitPrice_ = 0.0;
+    bool stopLossTriggered_ = false;
     double previousPrice_ = 0.0;
     bool hasPreviousPrice_ = false;
     std::string lastDecisionReason_ = "not evaluated";

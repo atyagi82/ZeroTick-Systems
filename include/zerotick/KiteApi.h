@@ -4,12 +4,27 @@
 
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 
 namespace zerotick {
 
+class KiteHttpError : public std::runtime_error {
+public:
+    KiteHttpError(unsigned int statusCode, const std::string& message)
+        : std::runtime_error(message),
+          statusCode_(statusCode) {}
+
+    unsigned int statusCode() const noexcept {
+        return statusCode_;
+    }
+
+private:
+    unsigned int statusCode_;
+};
+
 /**
- * Read-only market-data interface used by stock workers.
+ * Market-data and guarded order interface used by stock workers.
  */
 class KiteApi {
 public:
@@ -17,20 +32,26 @@ public:
 
     virtual MarketSnapshot getQuote(const std::string& symbol) = 0;
     virtual void refreshQuotes(const std::vector<std::string>& symbols) = 0;
-    virtual OrderResult placeMarketOrder(
+    virtual void ensureNoOpenMisExposure(const std::string& symbol) = 0;
+    virtual CashAvailability cashAvailability() = 0;
+    virtual OrderResult placeStopLimitEntry(
         const std::string& symbol,
-        bool buy,
-        int quantity) = 0;
-    virtual OrderResult exitPosition(
+        int quantity,
+        double triggerPrice,
+        double limitPrice) = 0;
+    virtual OrderResult placeLimitExit(
         const std::string& symbol,
-        int quantity) = 0;
+        int quantity,
+        double limitPrice) = 0;
+    virtual BrokerOrderStatus getOrderStatus(
+        const std::string& orderId) = 0;
+    virtual void cancelOrder(const std::string& orderId) = 0;
 
     virtual bool isHealthy() const = 0;
 };
 
 /**
- * Kite Connect REST adapter for authenticated quote snapshots.
- * Live order placement remains disabled.
+ * Kite Connect REST adapter for quote snapshots and MIS limit orders.
  */
 class KiteConnectApi : public KiteApi {
 public:
@@ -38,13 +59,20 @@ public:
 
     MarketSnapshot getQuote(const std::string& symbol) override;
     void refreshQuotes(const std::vector<std::string>& symbols) override;
-    OrderResult placeMarketOrder(
+    void ensureNoOpenMisExposure(const std::string& symbol) override;
+    CashAvailability cashAvailability() override;
+    OrderResult placeStopLimitEntry(
         const std::string& symbol,
-        bool buy,
-        int quantity) override;
-    OrderResult exitPosition(
+        int quantity,
+        double triggerPrice,
+        double limitPrice) override;
+    OrderResult placeLimitExit(
         const std::string& symbol,
-        int quantity) override;
+        int quantity,
+        double limitPrice) override;
+    BrokerOrderStatus getOrderStatus(
+        const std::string& orderId) override;
+    void cancelOrder(const std::string& orderId) override;
     bool isHealthy() const override;
 
 private:

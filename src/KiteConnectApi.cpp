@@ -1,4 +1,5 @@
 #include "zerotick/KiteApi.h"
+#include "zerotick/Risk.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -447,6 +448,12 @@ std::string safeErrorField(const json& response, const char* field) {
     return safe;
 }
 
+std::string orderPrice(double price) {
+    std::ostringstream formatted;
+    formatted << std::fixed << std::setprecision(2) << price;
+    return formatted.str();
+}
+
 std::string httpRequest(
     const char* operation,
     const wchar_t* method,
@@ -553,7 +560,7 @@ std::string httpRequest(
                 message << ": " << description;
             }
         }
-        throw std::runtime_error(message.str());
+        throw KiteHttpError(statusCode, message.str());
     }
     return response;
 }
@@ -708,7 +715,7 @@ void KiteConnectApi::refreshQuotes(
     }
 
     // Kite's quote endpoint accepts multiple instrument query parameters.
-    // Batch the whole watchlist to avoid one REST call per worker per second.
+    // Batch the whole watchlist to avoid one REST call per worker.
     std::wstring path = L"/quote?";
     for (std::size_t index = 0; index < symbols.size(); ++index) {
         if (index != 0) {
@@ -738,24 +745,175 @@ void KiteConnectApi::refreshQuotes(
     quotes_.swap(updated);
 }
 
-OrderResult KiteConnectApi::placeMarketOrder(
-    const std::string& symbol,
-    bool buy,
-    int quantity) {
-    // Keep live trading disabled until order-state reconciliation, risk
-    // validation, and explicit live-trading authorization are implemented.
-    (void)symbol;
-    (void)buy;
-    (void)quantity;
-    return {false, {}, "Live Kite orders are disabled"};
+void KiteConnectApi::ensureNoOpenMisExposure(const std::string& symbol) {
+    const std::string positionsResponse = httpRequest(
+        "Kite positions preflight",
+        L"GET", L"/portfolio/positions", std::string(),
+        apiKey_, accessToken_);
+    const json positions = json::parse(positionsResponse);
+    if (positions.value("status", std::string()) != "success") {
+        throw std::runtime_error("Kite positions preflight did not succeed");
+    }
+
+    const json& netPositions = positions.at("data").at("net");
+    for (const json& position : netPositions) {
+        if (position.value("tradingsymbol", std::string()) == symbol &&
+            position.value("product", std::string()) == "MIS" &&
+            position.value("quantity", 0) != 0) {
+            throw std::runtime_error(
+                "Live trading blocked: an MIS position already exists for " +
+                symbol);
+        }
+    }
+
+    const std::string ordersResponse = httpRequest(
+        "Kite pending-order preflight",
+        L"GET", L"/orders", std::string(), apiKey_, accessToken_);
+    const json orders = json::parse(ordersResponse);
+    if (orders.value("status", std::string()) != "success") {
+        throw std::runtime_error("Kite order preflight did not succeed");
+    }
+    for (const json& order : orders.at("data")) {
+        const std::string status = order.value("status", std::string());
+        const bool terminal =
+            status == "COMPLETE" ||
+            status == "REJECTED" ||
+            status == "CANCELLED";
+        if (!terminal &&
+            order.value("tradingsymbol", std::string()) == symbol &&
+            order.value("product", std::string()) == "MIS") {
+            throw std::runtime_error(
+                "Live trading blocked: an open MIS order already exists for " +
+                symbol);
+        }
+    }
 }
 
-OrderResult KiteConnectApi::exitPosition(
+CashAvailability KiteConnectApi::cashAvailability() {
+    const std::string response = httpRequest(
+        "Kite equity margin fetch",
+        L"GET", L"/user/margins/equity", std::string(),
+        apiKey_, accessToken_);
+    const json result = json::parse(response);
+    if (result.value("status", std::string()) != "success") {
+        throw std::runtime_error("Kite margin request did not succeed");
+    }
+
+    const json& equity = result.at("data");
+    const json& available = equity.at("available");
+    const double cash = available.at("cash").get<double>();
+    const double intradayPayin =
+        available.at("intraday_payin").get<double>();
+    const double adhocMargin =
+        available.at("adhoc_margin").get<double>();
+    const double liveBalance =
+        available.at("live_balance").get<double>();
+    const double collateral =
+        available.at("collateral").get<double>();
+    const double utilized =
+        equity.at("utilised").at("debits").get<double>();
+    return {
+        cash,
+        intradayPayin,
+        adhocMargin,
+        liveBalance,
+        utilized,
+        collateral,
+        calculateFreeCash(cash, intradayPayin, utilized, liveBalance)
+    };
+}
+
+OrderResult KiteConnectApi::placeStopLimitEntry(
     const std::string& symbol,
-    int quantity) {
-    (void)symbol;
-    (void)quantity;
-    return {false, {}, "Live Kite orders are disabled"};
+    int quantity,
+    double triggerPrice,
+    double limitPrice) {
+    if (quantity <= 0 || triggerPrice <= 0.0 || limitPrice < triggerPrice) {
+        throw std::invalid_argument("Invalid stop-limit entry parameters");
+    }
+    const std::string body =
+        "tradingsymbol=" + urlEncode(symbol) +
+        "&exchange=NSE&transaction_type=BUY&order_type=SL" +
+        "&quantity=" + std::to_string(quantity) +
+        "&product=MIS&validity=DAY&trigger_price=" +
+        orderPrice(triggerPrice) + "&price=" + orderPrice(limitPrice);
+    const std::string response = httpRequest(
+        "Kite MIS stop-limit entry",
+        L"POST", L"/orders/regular", body, apiKey_, accessToken_);
+    const json result = json::parse(response);
+    if (result.value("status", std::string()) != "success") {
+        throw std::runtime_error("Kite did not accept the entry order");
+    }
+    return {
+        true,
+        result.at("data").at("order_id").get<std::string>(),
+        "MIS stop-limit entry submitted"
+    };
+}
+
+OrderResult KiteConnectApi::placeLimitExit(
+    const std::string& symbol,
+    int quantity,
+    double limitPrice) {
+    if (quantity <= 0 || limitPrice <= 0.0) {
+        throw std::invalid_argument("Invalid limit-exit parameters");
+    }
+    const std::string body =
+        "tradingsymbol=" + urlEncode(symbol) +
+        "&exchange=NSE&transaction_type=SELL&order_type=LIMIT" +
+        "&quantity=" + std::to_string(quantity) +
+        "&product=MIS&validity=DAY&price=" + orderPrice(limitPrice);
+    const std::string response = httpRequest(
+        "Kite MIS limit exit",
+        L"POST", L"/orders/regular", body, apiKey_, accessToken_);
+    const json result = json::parse(response);
+    if (result.value("status", std::string()) != "success") {
+        throw std::runtime_error("Kite did not accept the exit order");
+    }
+    return {
+        true,
+        result.at("data").at("order_id").get<std::string>(),
+        "MIS limit exit submitted"
+    };
+}
+
+BrokerOrderStatus KiteConnectApi::getOrderStatus(
+    const std::string& orderId) {
+    const std::string response = httpRequest(
+        "Kite order status fetch",
+        L"GET", widenAscii("/orders/" + urlEncode(orderId)),
+        std::string(), apiKey_, accessToken_);
+    const json result = json::parse(response);
+    if (result.value("status", std::string()) != "success") {
+        throw std::runtime_error("Kite order status request did not succeed");
+    }
+
+    const json& history = result.at("data");
+    if (!history.is_array() || history.empty()) {
+        throw std::runtime_error("Kite returned empty order history");
+    }
+    const json& latest = history.back();
+    const std::string status = latest.at("status").get<std::string>();
+    return {
+        status,
+        latest.value("filled_quantity", 0),
+        latest.value("average_price", 0.0),
+        status == "COMPLETE" ||
+            status == "REJECTED" ||
+            status == "CANCELLED"
+    };
+}
+
+void KiteConnectApi::cancelOrder(const std::string& orderId) {
+    const std::string response = httpRequest(
+        "Kite order cancellation",
+        L"DELETE",
+        widenAscii("/orders/regular/" + urlEncode(orderId)),
+        std::string(), apiKey_, accessToken_);
+    const json result = json::parse(response);
+    if (result.value("status", std::string()) != "success") {
+        throw std::runtime_error("Kite did not confirm order cancellation");
+    }
 }
 
 bool KiteConnectApi::isHealthy() const {

@@ -1,10 +1,114 @@
 #include "zerotick/Strategy.h"
+#include "zerotick/Risk.h"
+#include "zerotick/Worker.h"
 
+#include <atomic>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 
 namespace {
+
+zerotick::MarketSnapshot makeBook(double lastPrice);
+
+class FakeKiteApi : public zerotick::KiteApi {
+public:
+    explicit FakeKiteApi(
+        std::atomic_bool& stopRequested,
+        bool stopAtEntrySignal = false,
+        bool rejectEntry = false,
+        bool repeatFirstQuote = false)
+        : stopRequested_(stopRequested),
+          stopAtEntrySignal_(stopAtEntrySignal),
+          rejectEntry_(rejectEntry),
+          repeatFirstQuote_(repeatFirstQuote) {}
+
+    zerotick::MarketSnapshot getQuote(const std::string&) override {
+        const std::size_t sample = quoteCount_++;
+        if (stopAtEntrySignal_ && sample >= 3) {
+            stopRequested_.store(true);
+        }
+        if (repeatFirstQuote_) {
+            if (!hasRepeatedQuote_) {
+                repeatedQuote_ = makeBook(100.00);
+                hasRepeatedQuote_ = true;
+            }
+            return repeatedQuote_;
+        }
+        if (sample < 4) {
+            return makeBook(100.00 + sample * 0.01);
+        }
+        return makeBook(100.31);
+    }
+
+    void refreshQuotes(const std::vector<std::string>&) override {}
+
+    void ensureNoOpenMisExposure(const std::string&) override {}
+
+    zerotick::CashAvailability cashAvailability() override {
+        ++freeCashRequests_;
+        return {10000.0, 0.0, 0.0, 10000.0, 0.0, 0.0, 10000.0};
+    }
+
+    zerotick::OrderResult placeStopLimitEntry(
+        const std::string&,
+        int quantity,
+        double triggerPrice,
+        double limitPrice) override {
+        entryQuantity = quantity;
+        entryTriggerPrice = triggerPrice;
+        entryLimitPrice = limitPrice;
+        if (rejectEntry_) {
+            stopRequested_.store(true);
+            throw zerotick::KiteHttpError(
+                403,
+                "Kite order permission denied");
+        }
+        return {true, "entry-order", "submitted"};
+    }
+
+    zerotick::OrderResult placeLimitExit(
+        const std::string&,
+        int quantity,
+        double limitPrice) override {
+        exitQuantity = quantity;
+        exitLimitPrice = limitPrice;
+        return {true, "exit-order", "submitted"};
+    }
+
+    zerotick::BrokerOrderStatus getOrderStatus(
+        const std::string&) override {
+        if (orderStatusCount_++ == 0) {
+            return {"COMPLETE", entryQuantity, 100.05, true};
+        }
+        stopRequested_.store(true);
+        return {"COMPLETE", exitQuantity, exitLimitPrice, true};
+    }
+
+    void cancelOrder(const std::string&) override {}
+
+    bool isHealthy() const override {
+        return true;
+    }
+
+    int entryQuantity = 0;
+    int exitQuantity = 0;
+    int freeCashRequests_ = 0;
+    double entryTriggerPrice = 0.0;
+    double entryLimitPrice = 0.0;
+    double exitLimitPrice = 0.0;
+
+private:
+    std::atomic_bool& stopRequested_;
+    bool stopAtEntrySignal_;
+    bool rejectEntry_;
+    bool repeatFirstQuote_;
+    bool hasRepeatedQuote_ = false;
+    zerotick::MarketSnapshot repeatedQuote_;
+    std::size_t quoteCount_ = 0;
+    std::size_t orderStatusCount_ = 0;
+};
 
 void require(bool condition, const std::string& message) {
     if (!condition) {
@@ -18,6 +122,7 @@ zerotick::MarketSnapshot makeBook(double lastPrice) {
     snapshot.lastPrice = lastPrice;
     snapshot.bidPrice = 99.99;
     snapshot.askPrice = 100.01;
+    snapshot.receivedAt = std::chrono::steady_clock::now();
 
     for (std::size_t level = 0; level < 5; ++level) {
         snapshot.bidLevels[level].price = 99.99 - level * 0.01;
@@ -48,6 +153,11 @@ void testEntryNeedsThreeConfirmedSnapshots() {
         strategy.evaluateEntry(makeBook(100.03)) ==
             zerotick::StrategyDecision::Enter,
         "third consecutive qualifying snapshot should trigger an entry");
+    const zerotick::StrategyDiagnostics diagnostics = strategy.diagnostics();
+    require(
+        diagnostics.entryTriggerPrice > 100.03 &&
+            diagnostics.entryLimitPrice > diagnostics.entryTriggerPrice,
+        "stop-limit trigger and limit should step above the current market");
 }
 
 void testWideSpreadBlocksEntry() {
@@ -63,6 +173,41 @@ void testWideSpreadBlocksEntry() {
     require(
         strategy.diagnostics().reason == "spread exceeds 0.10% limit",
         "wide spread should be reported as the entry reason");
+}
+
+void testModeratePositiveImbalanceCanQualify() {
+    zerotick::OrderImbalanceStrategy strategy;
+    for (std::size_t level = 0; level < 5; ++level) {
+        zerotick::MarketSnapshot snapshot = makeBook(100.00 + level * 0.01);
+        snapshot.bidQuantity = 0;
+        snapshot.askQuantity = 0;
+        for (zerotick::OrderBookLevel& bid : snapshot.bidLevels) {
+            bid.quantity = 1150;
+            snapshot.bidQuantity += bid.quantity;
+        }
+        for (zerotick::OrderBookLevel& ask : snapshot.askLevels) {
+            ask.quantity = 850;
+            snapshot.askQuantity += ask.quantity;
+        }
+        const zerotick::StrategyDecision decision =
+            strategy.evaluateEntry(snapshot);
+        if (level < 3) {
+            require(
+                decision == zerotick::StrategyDecision::None,
+                "moderate imbalance still needs three confirmations");
+        } else if (level == 3) {
+            require(
+                decision == zerotick::StrategyDecision::Enter,
+                "moderate positive imbalance should qualify after confirmation");
+        } else {
+            require(
+                decision == zerotick::StrategyDecision::None,
+                "one confirmation run should emit only one entry signal");
+        }
+    }
+    require(
+        strategy.diagnostics().orderImbalance > 0.10,
+        "test signal should be above the new imbalance threshold");
 }
 
 void testWeakImbalanceBlocksEntryAndResetsConfirmation() {
@@ -128,15 +273,129 @@ void testTargetAndStopExits() {
         "stop exit reason should be reported");
 }
 
+void testIntradayQuantityUsesOnlyEightyPercentOfAvailableCash() {
+    require(
+        zerotick::calculateIntradayQuantity(100000.0, 50.0) == 1600,
+        "quantity should use 80% of available cash, not all cash");
+    require(
+        zerotick::calculateIntradayQuantity(100000.0, 100000.0) == 0,
+        "insufficient cash should not produce a share quantity");
+}
+
+void testFreeCashSubtractsExistingUtilization() {
+    require(
+        std::abs(
+            zerotick::calculateFreeCash(
+                245431.60, 0.0, 145706.55, 99725.05) -
+            99725.05) < 0.0001,
+        "free cash should exclude already utilized funds");
+    require(
+        zerotick::calculateFreeCash(500.0, 0.0, 600.0, 900.0) == 0.0,
+        "utilization greater than cash should leave no spendable budget");
+    require(
+        zerotick::calculateFreeCash(1000.0, 0.0, 0.0, 500.0) == 500.0,
+        "free cash should not exceed Kite's current live balance");
+    require(
+        zerotick::calculateFreeCash(0.30, 101.0, 0.0, 101.30) == 101.30,
+        "intraday payin should be included but capped at live balance");
+}
+
+void testLiveWorkerSizesAndTracksStopLimitOrders() {
+    std::atomic_bool stopRequested{false};
+    FakeKiteApi api(stopRequested);
+    zerotick::Worker worker(
+        "IDEA",
+        api,
+        std::make_unique<zerotick::OrderImbalanceStrategy>(),
+        std::chrono::milliseconds(1),
+        stopRequested,
+        true);
+    worker.run();
+
+    require(api.freeCashRequests_ == 1, "live entry should read free cash");
+    require(api.entryQuantity == 79, "entry should use no more than 80% cash");
+    require(
+        std::abs(api.entryTriggerPrice - 100.04) < 0.001 &&
+            std::abs(api.entryLimitPrice - 100.05) < 0.001,
+        "entry should submit the strategy-derived stop-limit prices");
+    require(
+        api.exitQuantity == api.entryQuantity,
+        "exit should use the actual filled quantity");
+    require(
+        std::abs(api.exitLimitPrice - 100.26) < 0.001,
+        "target exit should use a tick-rounded target limit");
+}
+
+void testWorkerDoesNotSubmitOrdersWithoutRuntimeOptIn() {
+    std::atomic_bool stopRequested{false};
+    FakeKiteApi api(stopRequested, true);
+    zerotick::Worker worker(
+        "IDEA",
+        api,
+        std::make_unique<zerotick::OrderImbalanceStrategy>(),
+        std::chrono::milliseconds(1),
+        stopRequested,
+        false);
+    worker.run();
+
+    require(api.freeCashRequests_ == 0, "data-only mode must not check funds");
+    require(api.entryQuantity == 0, "data-only mode must not submit an entry");
+    require(api.exitQuantity == 0, "data-only mode must not submit an exit");
+}
+
+void testWorkerDoesNotCountRepeatedQuoteSnapshots() {
+    std::atomic_bool stopRequested{false};
+    FakeKiteApi api(stopRequested, true, false, true);
+    zerotick::Worker worker(
+        "YESBANK",
+        api,
+        std::make_unique<zerotick::OrderImbalanceStrategy>(),
+        std::chrono::milliseconds(1),
+        stopRequested,
+        true);
+    worker.run();
+
+    require(
+        api.freeCashRequests_ == 0,
+        "re-reading one cached quote must not satisfy snapshot confirmations");
+}
+
+void testDefinitiveKiteRejectionDoesNotLeaveUnknownPositionState() {
+    std::atomic_bool stopRequested{false};
+    FakeKiteApi api(stopRequested, false, true);
+    zerotick::Worker worker(
+        "IDEA",
+        api,
+        std::make_unique<zerotick::OrderImbalanceStrategy>(),
+        std::chrono::milliseconds(1),
+        stopRequested,
+        true);
+    worker.run();
+
+    require(
+        worker.state() == zerotick::WorkerState::Stopped,
+        "a definite HTTP rejection should not be treated as an unknown fill");
+    require(
+        api.exitQuantity == 0,
+        "a rejected entry must not cause an exit order");
+}
+
 } // namespace
 
 int main() {
     try {
         testEntryNeedsThreeConfirmedSnapshots();
         testWideSpreadBlocksEntry();
+        testModeratePositiveImbalanceCanQualify();
         testWeakImbalanceBlocksEntryAndResetsConfirmation();
         testFallingPriceResetsConfirmation();
         testTargetAndStopExits();
+        testIntradayQuantityUsesOnlyEightyPercentOfAvailableCash();
+        testFreeCashSubtractsExistingUtilization();
+        testLiveWorkerSizesAndTracksStopLimitOrders();
+        testWorkerDoesNotSubmitOrdersWithoutRuntimeOptIn();
+        testWorkerDoesNotCountRepeatedQuoteSnapshots();
+        testDefinitiveKiteRejectionDoesNotLeaveUnknownPositionState();
     } catch (const std::exception& exception) {
         std::cerr << "Strategy test failed: " << exception.what() << '\n';
         return 1;

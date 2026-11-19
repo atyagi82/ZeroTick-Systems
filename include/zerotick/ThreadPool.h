@@ -26,7 +26,8 @@ public:
     explicit ThreadPool(
         KiteApi& api,
         const std::vector<std::string>& symbols,
-        std::chrono::milliseconds pollInterval);
+        std::chrono::milliseconds pollInterval,
+        bool liveTrading);
 
     ~ThreadPool();
 
@@ -40,6 +41,7 @@ private:
     KiteApi& api_;
     std::vector<std::string> symbols_;
     std::chrono::milliseconds pollInterval_;
+    bool liveTrading_;
     std::atomic_bool stopRequested_{false};
     std::vector<std::thread> threads_;
 };

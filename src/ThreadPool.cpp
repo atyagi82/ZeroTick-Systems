@@ -9,10 +9,12 @@ namespace zerotick {
 ThreadPool::ThreadPool(
     KiteApi& api,
     const std::vector<std::string>& symbols,
-    std::chrono::milliseconds pollInterval)
+    std::chrono::milliseconds pollInterval,
+    bool liveTrading)
     : api_(api),
       symbols_(symbols),
-      pollInterval_(pollInterval) {
+      pollInterval_(pollInterval),
+      liveTrading_(liveTrading) {
     if (symbols_.size() != kWorkerCount) {
         throw std::invalid_argument(
             "ThreadPool requires exactly 20 symbols");
@@ -41,7 +43,8 @@ void ThreadPool::start() {
                 api_,
                 std::make_unique<OrderImbalanceStrategy>(),
                 pollInterval_,
-                stopRequested_);
+                stopRequested_,
+                liveTrading_);
             worker.run();
         });
     }
@@ -50,7 +53,8 @@ void ThreadPool::start() {
         "Started " + std::to_string(kActiveWorkerCount) + " of " +
         std::to_string(kWorkerCount) + " stock worker threads; " +
         std::to_string(kWorkerCount - kActiveWorkerCount) +
-        " disabled; active_symbol=" + symbols_.front());
+        " disabled; active_symbol=" + symbols_.front() +
+        " live_trading=" + (liveTrading_ ? "enabled" : "disabled"));
 }
 
 void ThreadPool::stop() {

@@ -1,8 +1,39 @@
 #include "zerotick/Strategy.h"
 
+#include <cmath>
+
 namespace zerotick {
 
 constexpr double OrderImbalanceStrategy::levelWeights_[5];
+
+namespace {
+
+double priceTick(const MarketSnapshot& snapshot) {
+    double smallestStep = 0.0;
+    for (std::size_t level = 1; level < 5; ++level) {
+        const double steps[] = {
+            snapshot.bidLevels[level - 1].price -
+                snapshot.bidLevels[level].price,
+            snapshot.askLevels[level].price -
+                snapshot.askLevels[level - 1].price
+        };
+        for (double step : steps) {
+            const double normalizedStep = std::round(step * 100.0) / 100.0;
+            if (normalizedStep > 0.0 &&
+                (smallestStep == 0.0 || normalizedStep < smallestStep)) {
+                smallestStep = normalizedStep;
+            }
+        }
+    }
+
+    return smallestStep > 0.0 ? smallestStep : 0.01;
+}
+
+double roundUpToTick(double price, double tick) {
+    return std::ceil(price / tick - 1e-9) * tick;
+}
+
+} // namespace
 
 void OrderImbalanceStrategy::updateOrderBookMetrics(
     const MarketSnapshot& snapshot) {
@@ -70,7 +101,7 @@ StrategyDecision OrderImbalanceStrategy::evaluateEntry(
         lastDecisionReason_ = "spread exceeds 0.10% limit";
     } else if (orderImbalance_ < minimumImbalance_) {
         consecutiveConfirmations_ = 0;
-        lastDecisionReason_ = "weighted imbalance below +0.25";
+        lastDecisionReason_ = "weighted imbalance below +0.10";
     } else if (!hasPreviousPrice) {
         consecutiveConfirmations_ = 0;
         lastDecisionReason_ = "waiting for price confirmation";
@@ -79,15 +110,28 @@ StrategyDecision OrderImbalanceStrategy::evaluateEntry(
         lastDecisionReason_ = "last price fell from previous snapshot";
     } else {
         ++consecutiveConfirmations_;
-        if (consecutiveConfirmations_ >= requiredConfirmations_) {
+        if (consecutiveConfirmations_ == requiredConfirmations_) {
+            const double tick = priceTick(snapshot);
+            const double triggerBase =
+                snapshot.lastPrice > snapshot.askPrice
+                ? snapshot.lastPrice
+                : snapshot.askPrice;
+            entryTriggerPrice_ =
+                roundUpToTick(triggerBase, tick) + tick;
+            entryLimitPrice_ = entryTriggerPrice_ + tick;
             lastDecisionReason_ =
-                "imbalance confirmed for 3 consecutive snapshots";
+                "imbalance confirmed; stop-limit entry prices calculated";
             return StrategyDecision::Enter;
         }
 
-        lastDecisionReason_ =
-            "imbalance confirmation " +
-            std::to_string(consecutiveConfirmations_) + "/3";
+        if (consecutiveConfirmations_ < requiredConfirmations_) {
+            lastDecisionReason_ =
+                "imbalance confirmation " +
+                std::to_string(consecutiveConfirmations_) + "/3";
+        } else {
+            lastDecisionReason_ =
+                "entry signal already issued for this confirmation run";
+        }
     }
 
     return StrategyDecision::None;
@@ -100,17 +144,20 @@ StrategyDecision OrderImbalanceStrategy::evaluateExit(
 
     if (entryPrice <= 0.0 || snapshot.lastPrice <= 0.0) {
         priceChangePercent_ = 0.0;
+        stopLossTriggered_ = false;
         lastDecisionReason_ = "cannot evaluate exit without valid prices";
         return StrategyDecision::None;
     }
 
     priceChangePercent_ =
         (snapshot.lastPrice - entryPrice) / entryPrice * 100.0;
+    stopLossTriggered_ = false;
     if (priceChangePercent_ >= targetPercent_) {
         lastDecisionReason_ = "0.20% profit target reached";
         return StrategyDecision::Exit;
     }
     if (priceChangePercent_ <= -stopPercent_) {
+        stopLossTriggered_ = true;
         lastDecisionReason_ = "0.40% stop loss reached";
         return StrategyDecision::Exit;
     }
@@ -125,6 +172,9 @@ StrategyDiagnostics OrderImbalanceStrategy::diagnostics() const {
     result.orderImbalance = orderImbalance_;
     result.spreadPercent = spreadPercent_;
     result.priceChangePercent = priceChangePercent_;
+    result.entryTriggerPrice = entryTriggerPrice_;
+    result.entryLimitPrice = entryLimitPrice_;
+    result.stopLossTriggered = stopLossTriggered_;
     result.consecutiveConfirmations = consecutiveConfirmations_;
     result.reason = lastDecisionReason_;
     return result;

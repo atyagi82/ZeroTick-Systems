@@ -23,10 +23,9 @@ void handleSignal(int) {
 } // namespace
 
 int main(int argumentCount, char* arguments[]) {
-    // TODO: Replace these placeholders with the current Nifty 50 top-20
-    // liquid/universe symbols selected by your application configuration.
+    // Keep the 20-symbol quote watchlist; only YESBANK has an active worker.
     const std::vector<std::string> symbols = {
-        "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "BHARTIARTL",
+        "YESBANK", "HDFCBANK", "ICICIBANK", "INFY", "BHARTIARTL",
         "TCS", "SBIN", "ITC", "LT", "AXISBANK",
         "HINDUNILVR", "KOTAKBANK", "BAJFINANCE", "M&M", "MARUTI",
         "SUNPHARMA", "TITAN", "ONGC", "NTPC", "ULTRACEMCO"
@@ -37,9 +36,13 @@ int main(int argumentCount, char* arguments[]) {
 
     try {
         bool forceLogin = false;
+        bool liveTrading = false;
         for (int index = 1; index < argumentCount; ++index) {
             if (std::string(arguments[index]) == "--login") {
                 forceLogin = true;
+            } else if (std::string(arguments[index]) ==
+                       "--enable-live-trading") {
+                liveTrading = true;
             } else {
                 throw std::invalid_argument(
                     "Unknown argument: " + std::string(arguments[index]));
@@ -50,14 +53,20 @@ int main(int argumentCount, char* arguments[]) {
         // local credentials are missing, expired, or rejected by Kite.
         zerotick::KiteConnectApi kiteApi(forceLogin);
         kiteApi.refreshQuotes(symbols);
+        if (liveTrading) {
+            kiteApi.ensureNoOpenMisExposure(symbols.front());
+            zerotick::logLine(
+                "[kite] live_trading=enabled symbol=" + symbols.front() +
+                " max_cash_utilization_pct=80 product=MIS");
+        }
         zerotick::logLine(
             "[kite] quote_batch=received instruments=" +
             std::to_string(symbols.size()));
         zerotick::ThreadPool pool(
-            kiteApi, symbols, std::chrono::seconds(1));
+            kiteApi, symbols, std::chrono::seconds(1), liveTrading);
         pool.start();
 
-        // Fetch one batched quote response per interval, not 20 concurrent
+        // Fetch one batched quote response per second, not 20 concurrent
         // REST requests from individual stock workers.
         std::thread quotePoller([&] {
             while (!shutdownRequested.load()) {

@@ -25,7 +25,8 @@ public:
         KiteApi& api,
         std::unique_ptr<Strategy> strategy,
         std::chrono::milliseconds pollInterval,
-        std::atomic_bool& stopRequested);
+        std::atomic_bool& stopRequested,
+        bool liveTrading);
 
     void run();
     WorkerState state() const;
@@ -35,8 +36,11 @@ private:
     void start();
     void monitor();
     void handleEntry();
+    void handleEntryPending();
     void handlePosition();
-    void handleExit();
+    void handleExit(const MarketSnapshot& snapshot);
+    void handleExitPending();
+    void submitExit(const MarketSnapshot& snapshot, bool stopLoss);
     void stop();
 
     std::string symbol_;
@@ -44,11 +48,22 @@ private:
     std::unique_ptr<Strategy> strategy_;
     std::chrono::milliseconds pollInterval_;
     std::atomic_bool& stopRequested_;
+    bool liveTrading_;
 
     mutable std::mutex stateMutex_;
     WorkerStateMachine stateMachine_;
     double entryPrice_ = 0.0;
-    int quantity_ = 1;
+    int quantity_ = 0;
+    std::string entryOrderId_;
+    std::string exitOrderId_;
+    std::chrono::steady_clock::time_point entryOrderSubmittedAt_;
+    std::chrono::steady_clock::time_point exitOrderSubmittedAt_;
+    std::chrono::steady_clock::time_point exitRetryAfter_;
+    std::chrono::steady_clock::time_point lastStrategySnapshotAt_;
+    int exitOrderQuantity_ = 0;
+    bool entryCancelRequested_ = false;
+    bool exitCancelRequested_ = false;
+    bool exitIsStopLoss_ = false;
 };
 
 } // namespace zerotick

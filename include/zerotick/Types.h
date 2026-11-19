@@ -39,4 +39,21 @@ struct OrderResult {
     std::string message;
 };
 
+struct BrokerOrderStatus {
+    std::string status;
+    int filledQuantity = 0;
+    double averagePrice = 0.0;
+    bool terminal = false;
+};
+
+struct CashAvailability {
+    double rawCash = 0.0;
+    double intradayPayin = 0.0;
+    double adhocMargin = 0.0;
+    double liveBalance = 0.0;
+    double utilizedDebits = 0.0;
+    double collateral = 0.0;
+    double freeCash = 0.0;
+};
+
 } // namespace zerotick
