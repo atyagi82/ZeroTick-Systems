@@ -4,6 +4,7 @@
 
 #include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -31,7 +32,8 @@ public:
     virtual ~KiteApi() = default;
 
     virtual MarketSnapshot getQuote(const std::string& symbol) = 0;
-    virtual void refreshQuotes(const std::vector<std::string>& symbols) = 0;
+    virtual std::vector<MarketSnapshot> refreshQuotes(
+        const std::vector<std::string>& symbols) = 0;
     virtual void ensureNoOpenMisExposure(
         const std::vector<std::string>& symbols) = 0;
     virtual CashAvailability cashAvailability() = 0;
@@ -64,7 +66,8 @@ public:
     explicit KiteConnectApi(bool forceLogin = false);
 
     MarketSnapshot getQuote(const std::string& symbol) override;
-    void refreshQuotes(const std::vector<std::string>& symbols) override;
+    std::vector<MarketSnapshot> refreshQuotes(
+        const std::vector<std::string>& symbols) override;
     void ensureNoOpenMisExposure(
         const std::vector<std::string>& symbols) override;
     CashAvailability cashAvailability() override;
@@ -93,6 +96,7 @@ private:
     bool healthy_ = false;
     mutable std::mutex quoteMutex_;
     std::map<std::string, MarketSnapshot> quotes_;
+    std::set<std::string> missingQuoteSymbols_;
 };
 
 } // namespace zerotick

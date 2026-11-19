@@ -42,7 +42,10 @@ public:
         return makeBook(100.31);
     }
 
-    void refreshQuotes(const std::vector<std::string>&) override {}
+    std::vector<zerotick::MarketSnapshot> refreshQuotes(
+        const std::vector<std::string>&) override {
+        return {};
+    }
 
     void ensureNoOpenMisExposure(
         const std::vector<std::string>&) override {}

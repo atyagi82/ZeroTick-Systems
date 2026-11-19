@@ -1,6 +1,9 @@
 #include "zerotick/KiteApi.h"
 #include "zerotick/Log.h"
-#include "zerotick/ThreadPool.h"
+#include "zerotick/EngineTypes.h"
+#include "zerotick/StockSelectionEngine.h"
+#include "zerotick/TradingDecisionEngine.h"
+#include "zerotick/TradeHandlingEngine.h"
 
 #include <atomic>
 #include <chrono>
@@ -20,17 +23,29 @@ void handleSignal(int) {
     shutdownRequested.store(true);
 }
 
+void refreshQuotesInChunks(zerotick::KiteApi& api,
+                           const std::vector<std::string>& symbols,
+                           std::size_t chunkSize,
+                           zerotick::ThreadSafeQueue<
+                               zerotick::MarketSnapshot>& quoteUpdates) {
+    for (std::size_t index = 0; index < symbols.size(); index += chunkSize) {
+        std::vector<std::string> chunk;
+        chunk.reserve(chunkSize);
+        for (std::size_t j = index; j < index + chunkSize && j < symbols.size();
+             ++j) {
+            chunk.push_back(symbols[j]);
+        }
+        const std::vector<zerotick::MarketSnapshot> refreshed =
+            api.refreshQuotes(chunk);
+        for (const zerotick::MarketSnapshot& snapshot : refreshed) {
+            quoteUpdates.push(snapshot);
+        }
+    }
+}
+
 } // namespace
 
 int main(int argumentCount, char* arguments[]) {
-    // Keep the existing 20-symbol watchlist; each symbol gets one worker.
-    const std::vector<std::string> symbols = {
-        "YESBANK", "HDFCBANK", "ICICIBANK", "INFY", "BHARTIARTL",
-        "TCS", "SBIN", "ITC", "LT", "AXISBANK",
-        "HINDUNILVR", "KOTAKBANK", "BAJFINANCE", "M&M", "MARUTI",
-        "SUNPHARMA", "TITAN", "ONGC", "NTPC", "ULTRACEMCO"
-    };
-
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
 
@@ -38,21 +53,23 @@ int main(int argumentCount, char* arguments[]) {
         bool forceLogin = false;
         bool liveTrading = false;
         for (int index = 1; index < argumentCount; ++index) {
-            if (std::string(arguments[index]) == "--login") {
+            std::string argument(arguments[index]);
+            if (argument == "--login") {
                 forceLogin = true;
-            } else if (std::string(arguments[index]) ==
-                       "--enable-live-trading") {
+            } else if (argument == "--enable-live-trading") {
                 liveTrading = true;
             } else {
-                throw std::invalid_argument(
-                    "Unknown argument: " + std::string(arguments[index]));
+                throw std::invalid_argument("Unknown argument: " + argument);
             }
         }
 
-        // Authentication and the first batch quote request fail fast if the
-        // local credentials are missing, expired, or rejected by Kite.
         zerotick::KiteConnectApi kiteApi(forceLogin);
-        kiteApi.refreshQuotes(symbols);
+
+        zerotick::NiftyUniverse universe;
+        std::vector<std::string> symbols = universe.symbols();
+        zerotick::ThreadSafeQueue<zerotick::MarketSnapshot> quoteUpdates;
+        refreshQuotesInChunks(kiteApi, symbols, 40, quoteUpdates);
+
         double totalAvailableCash = 0.0;
         if (liveTrading) {
             kiteApi.ensureNoOpenMisExposure(symbols);
@@ -60,28 +77,38 @@ int main(int argumentCount, char* arguments[]) {
             zerotick::logLine(
                 "[kite] live_trading=enabled symbols=" +
                 std::to_string(symbols.size()) +
-                " portfolio_cash_budget=" +
-                std::to_string(totalAvailableCash) +
-                " equal_slot_budget=" +
-                std::to_string(
-                    totalAvailableCash / zerotick::kMaximumLivePositions) +
-                " max_open_positions=" +
+                " cash_budget=" + std::to_string(totalAvailableCash) +
+                " max_positions=" +
                 std::to_string(zerotick::kMaximumLivePositions) +
                 " product=MIS");
         }
-        zerotick::logLine(
-            "[kite] quote_batch=received instruments=" +
-            std::to_string(symbols.size()));
-        zerotick::ThreadPool pool(
-            kiteApi,
-            symbols,
-            std::chrono::seconds(1),
-            liveTrading,
-            totalAvailableCash);
-        pool.start();
 
-        // Fetch one batched quote response per second, not 20 concurrent
-        // REST requests from individual stock workers.
+        zerotick::PortfolioRiskManager portfolioRisk(
+            totalAvailableCash, zerotick::kMaximumLivePositions);
+
+        zerotick::ThreadSafeQueue<zerotick::StockCandidate> selectionToDecision;
+        zerotick::ThreadSafeQueue<zerotick::TradeSignal> decisionToHandling;
+        zerotick::StockEngineRegistry registry;
+
+        zerotick::SelectionConfig selectionConfig;
+        zerotick::DecisionConfig decisionConfig;
+        zerotick::HandlingConfig handlingConfig;
+        handlingConfig.liveTrading = liveTrading;
+
+        zerotick::StockSelectionEngine selectionEngine(
+            quoteUpdates, registry, selectionToDecision, universe,
+            selectionConfig);
+        zerotick::TradingDecisionEngine decisionEngine(
+            kiteApi, registry, selectionToDecision, decisionToHandling,
+            decisionConfig);
+        zerotick::TradeHandlingEngine handlingEngine(
+            kiteApi, registry, decisionToHandling, portfolioRisk,
+            handlingConfig);
+
+        selectionEngine.start();
+        decisionEngine.start();
+        handlingEngine.start();
+
         std::thread quotePoller([&] {
             while (!shutdownRequested.load()) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -89,11 +116,11 @@ int main(int argumentCount, char* arguments[]) {
                     break;
                 }
                 try {
-                    kiteApi.refreshQuotes(symbols);
+                    refreshQuotesInChunks(kiteApi, symbols, 40, quoteUpdates);
                 } catch (const std::exception& exception) {
                     zerotick::logLine(
                         std::string("[kite] quote_batch=failed reason=\"") +
-                        exception.what() + '"');
+                        exception.what() + std::string("\""));
                 }
             }
         });
@@ -102,11 +129,20 @@ int main(int argumentCount, char* arguments[]) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        std::cout << "Shutdown requested; stopping workers\n";
+        std::cout << "Shutdown requested; stopping engines\n";
         quotePoller.join();
-        pool.stop();
+        selectionEngine.stop();
+        decisionEngine.stop();
+        handlingEngine.stop();
+
+        zerotick::logLine(
+            "[engines] in_flight=" +
+            std::to_string(
+                registry.countInEngine(zerotick::EngineId::Selection) +
+                registry.countInEngine(zerotick::EngineId::Decision) +
+                registry.countInEngine(zerotick::EngineId::Handling)));
     } catch (const std::exception& exception) {
-        std::cerr << "Fatal error: " << exception.what() << '\n';
+        std::cerr << "Fatal error: " << exception.what() << "\n";
         return 1;
     }
 

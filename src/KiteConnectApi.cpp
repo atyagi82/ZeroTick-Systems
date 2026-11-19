@@ -1,4 +1,5 @@
 #include "zerotick/KiteApi.h"
+#include "zerotick/Log.h"
 #include "zerotick/Risk.h"
 
 #include <winsock2.h>
@@ -644,6 +645,17 @@ MarketSnapshot parseQuote(
             sells.at(index).at("quantity").get<std::uint64_t>();
         snapshot.askQuantity += snapshot.askLevels[index].quantity;
     }
+
+    // Intraday suitability fields used by StockSelectionEngine: traded volume
+    // (for relative-volume / liquidity checks) and the OHLC range (for
+    // volatility / intraday-range checks). Kite returns these when present;
+    // they default to zero otherwise.
+    snapshot.volume = quote.value("volume", std::uint64_t(0));
+    const json& ohlc = quote.value("ohlc", json::object());
+    snapshot.openPrice = ohlc.value("open", 0.0);
+    snapshot.highPrice = ohlc.value("high", 0.0);
+    snapshot.lowPrice = ohlc.value("low", 0.0);
+
     return snapshot;
 }
 
@@ -712,7 +724,7 @@ MarketSnapshot KiteConnectApi::getQuote(const std::string& symbol) {
     return found->second;
 }
 
-void KiteConnectApi::refreshQuotes(
+std::vector<MarketSnapshot> KiteConnectApi::refreshQuotes(
     const std::vector<std::string>& symbols) {
     if (symbols.empty()) {
         throw std::invalid_argument("Kite quote refresh needs symbols");
@@ -739,14 +751,49 @@ void KiteConnectApi::refreshQuotes(
     }
 
     std::map<std::string, MarketSnapshot> updated;
+    std::vector<MarketSnapshot> refreshed;
+    refreshed.reserve(symbols.size());
+    {
+        // Seed with the current cache so chunked refreshes accumulate rather
+        // than replace previously cached instruments.
+        std::lock_guard<std::mutex> lock(quoteMutex_);
+        updated = quotes_;
+    }
     const json& data = result.at("data");
     for (const std::string& symbol : symbols) {
-        updated[symbol] = parseQuote(data.at("NSE:" + symbol), symbol);
+        const std::string key = "NSE:" + symbol;
+        const auto it = data.find(key);
+        if (it == data.end() || !it->is_object()) {
+            // Kite did not return a quote for this instrument (e.g. not
+            // tradable / delisted / unknown token). Skip rather than crash so
+            // the rest of the universe can still be evaluated.
+            bool firstMissing = false;
+            {
+                std::lock_guard<std::mutex> lock(quoteMutex_);
+                firstMissing = missingQuoteSymbols_.insert(symbol).second;
+            }
+            if (firstMissing) {
+                zerotick::logLine("[kite] quote_missing symbol=" + symbol);
+            }
+            continue;
+        }
+        MarketSnapshot snapshot = parseQuote(*it, symbol);
+        bool recovered = false;
+        {
+            std::lock_guard<std::mutex> lock(quoteMutex_);
+            recovered = missingQuoteSymbols_.erase(symbol) > 0;
+        }
+        if (recovered) {
+            zerotick::logLine("[kite] quote_restored symbol=" + symbol);
+        }
+        updated[symbol] = snapshot;
+        refreshed.push_back(std::move(snapshot));
     }
 
-    // Replace the cache in one operation so readers never mix two batches.
+    // Merge into the cache in one operation so readers never mix two batches.
     std::lock_guard<std::mutex> lock(quoteMutex_);
     quotes_.swap(updated);
+    return refreshed;
 }
 
 void KiteConnectApi::ensureNoOpenMisExposure(

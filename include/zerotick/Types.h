@@ -29,6 +29,10 @@ struct MarketSnapshot {
     std::array<OrderBookLevel, 5> askLevels{};
     std::uint64_t bidQuantity = 0;
     std::uint64_t askQuantity = 0;
+    std::uint64_t volume = 0;
+    double openPrice = 0.0;
+    double highPrice = 0.0;
+    double lowPrice = 0.0;
     std::uint64_t sequence = 0;
     std::chrono::steady_clock::time_point receivedAt;
 };

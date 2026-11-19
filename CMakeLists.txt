@@ -25,6 +25,10 @@ add_library(zerotick_core
     src/KiteConnectApi.cpp
     src/Worker.cpp
     src/ThreadPool.cpp
+    src/EngineTypes.cpp
+    src/StockSelectionEngine.cpp
+    src/TradingDecisionEngine.cpp
+    src/TradeHandlingEngine.cpp
 )
 
 target_include_directories(zerotick_core PUBLIC include)
@@ -40,4 +44,8 @@ if(BUILD_TESTING)
     add_executable(strategy_tests tests/StrategyTests.cpp)
     target_link_libraries(strategy_tests PRIVATE zerotick_core)
     add_test(NAME strategy_tests COMMAND strategy_tests)
+
+    add_executable(engine_tests tests/EngineTests.cpp)
+    target_link_libraries(engine_tests PRIVATE zerotick_core)
+    add_test(NAME engine_tests COMMAND engine_tests)
 endif()
