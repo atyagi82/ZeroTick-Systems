@@ -20,11 +20,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nlohmann_json)
 
 add_library(zerotick_core
-    src/StateMachine.cpp
-    src/Strategy.cpp
     src/KiteConnectApi.cpp
-    src/Worker.cpp
-    src/ThreadPool.cpp
     src/EngineTypes.cpp
     src/StockSelectionEngine.cpp
     src/TradingDecisionEngine.cpp
@@ -41,10 +37,6 @@ add_executable(zerotick src/main.cpp)
 target_link_libraries(zerotick PRIVATE zerotick_core)
 
 if(BUILD_TESTING)
-    add_executable(strategy_tests tests/StrategyTests.cpp)
-    target_link_libraries(strategy_tests PRIVATE zerotick_core)
-    add_test(NAME strategy_tests COMMAND strategy_tests)
-
     add_executable(engine_tests tests/EngineTests.cpp)
     target_link_libraries(engine_tests PRIVATE zerotick_core)
     add_test(NAME engine_tests COMMAND engine_tests)

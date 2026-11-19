@@ -886,56 +886,6 @@ CashAvailability KiteConnectApi::cashAvailability() {
     };
 }
 
-double KiteConnectApi::estimateMisOrderFunds(
-    const std::string& symbol,
-    int quantity,
-    double triggerPrice,
-    double limitPrice) {
-    if (symbol.empty() || quantity <= 0 ||
-        triggerPrice <= 0.0 || limitPrice < triggerPrice) {
-        throw std::invalid_argument(
-            "Invalid MIS margin-estimate parameters");
-    }
-
-    json order = {
-        {"exchange", "NSE"},
-        {"tradingsymbol", symbol},
-        {"transaction_type", "BUY"},
-        {"variety", "regular"},
-        {"product", "MIS"},
-        {"order_type", "SL"},
-        {"quantity", quantity},
-        {"price", limitPrice},
-        {"trigger_price", triggerPrice}
-    };
-    const json body = json::array({order});
-    const std::string response = httpRequest(
-        "Kite MIS order margin estimate",
-        L"POST", L"/margins/orders", body.dump(),
-        apiKey_, accessToken_, true);
-    const json result = json::parse(response);
-    if (result.value("status", std::string()) != "success") {
-        throw std::runtime_error(
-            "Kite MIS margin estimate did not succeed");
-    }
-
-    const json& margins = result.at("data");
-    if (!margins.is_array() || margins.size() != 1) {
-        throw std::runtime_error(
-            "Kite returned an invalid MIS margin estimate");
-    }
-    const json& margin = margins.at(0);
-    const double requiredMargin = margin.at("total").get<double>();
-    const double estimatedCharges =
-        margin.at("charges").at("total").get<double>();
-    const double totalRequired = requiredMargin + estimatedCharges;
-    if (!std::isfinite(totalRequired) || totalRequired <= 0.0) {
-        throw std::runtime_error(
-            "Kite returned an invalid MIS margin or charge estimate");
-    }
-    return totalRequired;
-}
-
 OrderResult KiteConnectApi::placeStopLimitEntry(
     const std::string& symbol,
     int quantity,

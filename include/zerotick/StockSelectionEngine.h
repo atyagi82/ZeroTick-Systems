@@ -18,9 +18,9 @@ namespace zerotick {
 /**
  * StockSelectionEngine
  * --------------------
- * Selects stocks for intraday trade from the configured universe (NIFTY 100)
- * using liquidity/volatility/volume parameters, then
- * publishes qualifying StockCandidates to the TradingDecisionEngine.
+ * Selects stocks for intraday trade from the configured universe using
+ * price-movement, liquidity, volatility, and volume filters, then publishes
+ * qualifying StockCandidates to the TradingDecisionEngine.
  *
  * Runs multiple workers that wait for quote updates. A symbol is claimed into
  * the Selection engine for the duration of its evaluation and, once selected,
@@ -49,8 +49,15 @@ private:
                            std::string& rejectionReason) const;
     double updateAverageVolume(const std::string& symbol,
                                std::uint64_t volume) const;
-    double priceChangePercent(const std::string& symbol,
-                              double lastPrice) const;
+
+    // The receipt time lets parallel workers reject delayed events without
+    // replacing a symbol's baseline with an older quote.
+    struct PriceObservation {
+        double price = 0.0;
+        std::chrono::steady_clock::time_point receivedAt;
+    };
+
+    double priceChangePercent(const MarketSnapshot& snapshot) const;
 
     ThreadSafeQueue<MarketSnapshot>& quoteUpdates_;
     StockEngineRegistry& registry_;
@@ -64,7 +71,7 @@ private:
     mutable std::mutex volumeMutex_;
     mutable std::unordered_map<std::string, double> averageVolume_;
     mutable std::mutex priceMutex_;
-    mutable std::unordered_map<std::string, double> previousPrice_;
+    mutable std::unordered_map<std::string, PriceObservation> previousPrice_;
 };
 
 } // namespace zerotick

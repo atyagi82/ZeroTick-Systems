@@ -116,6 +116,8 @@ int main(int argumentCount, char* arguments[]) {
                     break;
                 }
                 try {
+                    // Only returned quote snapshots enter selection. The API
+                    // cache remains available for the decision-stage recheck.
                     refreshQuotesInChunks(kiteApi, symbols, 40, quoteUpdates);
                 } catch (const std::exception& exception) {
                     zerotick::logLine(

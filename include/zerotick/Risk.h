@@ -13,6 +13,10 @@ namespace zerotick {
 
 constexpr std::size_t kMaximumLivePositions = 10;
 
+/**
+ * Thread-safe concurrent-position cap. Each reservation is limited to the
+ * smaller of current free cash and the startup budget divided by slot count.
+ */
 class PortfolioRiskManager {
 public:
     explicit PortfolioRiskManager(
@@ -61,10 +65,6 @@ public:
         reservations_.erase(symbol);
     }
 
-    std::mutex& entryWorkflowMutex() noexcept {
-        return entryWorkflowMutex_;
-    }
-
     std::size_t activeReservations() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return reservations_.size();
@@ -77,7 +77,6 @@ public:
 private:
     const double totalAvailableCash_;
     const std::size_t maximumPositions_;
-    std::mutex entryWorkflowMutex_;
     mutable std::mutex mutex_;
     std::unordered_set<std::string> reservations_;
 };
@@ -108,6 +107,8 @@ inline double calculateFreeCash(
         : liveBalance;
 }
 
+// Quantity is whole shares and rounds down so its price-based cost stays in
+// budget; this helper does not estimate broker-specific MIS margin.
 inline int calculateQuantityWithinBudget(
     double availableBudget,
     double perShareRequirement) {

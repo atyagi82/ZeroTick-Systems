@@ -97,6 +97,7 @@ void TradingDecisionEngine::workerLoop() {
 
 double TradingDecisionEngine::weightedImbalance(
     const MarketSnapshot& snapshot) const {
+    // Nearer book levels matter more, so each deeper level gets less weight.
     static constexpr double levelWeights[5] = {
         1.0, 0.8, 0.6, 0.4, 0.2
     };
@@ -109,10 +110,13 @@ double TradingDecisionEngine::weightedImbalance(
                        static_cast<double>(snapshot.askLevels[level].quantity);
     }
     const double total = weightedBid + weightedAsk;
+    // Normalize to [-1, +1]; positive values indicate stronger bid depth.
     return total > 0.0 ? (weightedBid - weightedAsk) / total : 0.0;
 }
 
 double priceTick(const MarketSnapshot& snapshot) {
+    // Infer a usable tick from adjacent depth prices, falling back when the
+    // quote does not provide enough valid levels.
     double smallestStep = 0.0;
     for (std::size_t level = 1; level < 5; ++level) {
         const double steps[] = {
@@ -171,12 +175,15 @@ bool TradingDecisionEngine::evaluateDecision(
     const double tick = priceTick(fresh);
     const double triggerBase =
         fresh.lastPrice > fresh.askPrice ? fresh.lastPrice : fresh.askPrice;
+    // Trigger above the greater of last/ask, then place the limit one tick
+    // above the trigger to reduce the chance of an invalid stop-limit pair.
     const double entryTrigger =
         roundUpToTick(triggerBase, tick) + tick;
     const double entryLimit = entryTrigger + tick;
 
     signal.entryTriggerPrice = entryTrigger;
     signal.entryLimitPrice = entryLimit;
+    // Configured target/stop values are percentage points (0.20 means 0.20%).
     signal.targetPrice = entryLimit * (1.0 + config_.targetPercent / 100.0);
     signal.stopLossPrice = entryLimit * (1.0 - config_.stopPercent / 100.0);
 

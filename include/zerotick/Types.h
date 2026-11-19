@@ -15,8 +15,8 @@ struct OrderBookLevel {
 /**
  * Market snapshot returned by a broker or market-data provider.
  *
- * In production this structure should also carry timestamps, bid/ask
- * quantities, tick sequence numbers, and venue information.
+ * `receivedAt` records when this process parsed the quote; it is used for
+ * local freshness checks and is not the exchange's market-data timestamp.
  */
 struct MarketSnapshot {
     std::string symbol;

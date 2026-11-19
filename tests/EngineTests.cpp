@@ -75,9 +75,6 @@ public:
     zerotick::CashAvailability cashAvailability() override {
         return {100000.0, 0.0, 0.0, 100000.0, 0.0, 0.0, 100000.0};
     }
-    double estimateMisOrderFunds(const std::string&, int, double, double) override {
-        return 0.0;
-    }
     zerotick::OrderResult placeStopLimitEntry(const std::string&, int, double,
                                               double) override {
         return {true, "order", "submitted"};
@@ -157,12 +154,16 @@ void testRegistryOneEngineAtATime() {
 }
 
 void testSelectionSelectsGoodStock() {
-    zerotick::MarketSnapshot quote = makeQuote(150.0, 200000, 5000, 1000,
-                                               149.0, 151.0, 148.0);
     TestUniverse universe({"TEST"});
     zerotick::StockEngineRegistry registry;
     zerotick::ThreadSafeQueue<zerotick::MarketSnapshot> quoteUpdates;
-    quoteUpdates.push(quote);
+    zerotick::MarketSnapshot baseline =
+        makeQuote(150.0, 200000, 5000, 1000, 149.0, 151.0, 148.0);
+    zerotick::MarketSnapshot rising =
+        makeQuote(150.15, 200000, 5000, 1000, 149.0, 151.0, 148.0);
+    rising.receivedAt = baseline.receivedAt + std::chrono::milliseconds(1);
+    quoteUpdates.push(baseline);
+    quoteUpdates.push(rising);
     zerotick::ThreadSafeQueue<zerotick::StockCandidate> output;
     zerotick::SelectionConfig config;
     config.workerCount = 1;
@@ -182,10 +183,64 @@ void testSelectionSelectsGoodStock() {
     require(output.pop(candidate, std::chrono::seconds(2)),
             "selection should emit a candidate for a good stock");
     require(candidate.symbol == "TEST", "candidate symbol");
-    require(candidate.lastPrice == 150.0, "candidate price");
+    require(candidate.lastPrice == 150.15, "candidate uses latest quote price");
+    require(
+        std::abs(candidate.priceChangePercent - 0.1) < 0.001,
+        "candidate price change should compare against the previous quote");
     require(candidate.inNifty100, "candidate in nifty 100");
     require(candidate.relativeVolume > 0.0, "relative volume computed");
 
+    require(registry.release("TEST", zerotick::EngineId::Selection),
+            "release first candidate to process later quote events");
+    zerotick::MarketSnapshot delayed =
+        makeQuote(150.0, 200000, 5000, 1000, 149.0, 151.0, 148.0);
+    zerotick::MarketSnapshot latest =
+        makeQuote(150.23, 200000, 5000, 1000, 149.0, 151.0, 148.0);
+    delayed.receivedAt = baseline.receivedAt + std::chrono::milliseconds(1);
+    latest.receivedAt = baseline.receivedAt + std::chrono::milliseconds(3);
+    quoteUpdates.push(delayed);
+    quoteUpdates.push(latest);
+
+    require(output.pop(candidate, std::chrono::seconds(2)),
+            "selection should ignore an out-of-order quote and process latest");
+    require(
+        std::abs(candidate.priceChangePercent - (0.08 / 150.15 * 100.0)) <
+            0.001,
+        "an older quote must not roll the price baseline backward");
+
+    engine.stop();
+}
+
+void testSelectionRejectsPriceChangeBelowMinimum() {
+    TestUniverse universe({"TEST"});
+    zerotick::StockEngineRegistry registry;
+    zerotick::ThreadSafeQueue<zerotick::MarketSnapshot> quoteUpdates;
+    zerotick::MarketSnapshot baseline =
+        makeQuote(150.0, 200000, 5000, 1000, 149.0, 151.0, 148.0);
+    zerotick::MarketSnapshot smallRise =
+        makeQuote(150.06, 200000, 5000, 1000, 149.0, 151.0, 148.0);
+    smallRise.receivedAt = baseline.receivedAt + std::chrono::milliseconds(1);
+    quoteUpdates.push(baseline);
+    quoteUpdates.push(smallRise);
+    zerotick::ThreadSafeQueue<zerotick::StockCandidate> output;
+    zerotick::SelectionConfig config;
+    config.workerCount = 1;
+    config.minAbsoluteVolume = 1000;
+    config.minRelativeVolume = 0.0;
+    config.maxSpreadPercent = 0.5;
+    config.minDepthQuantity = 100;
+    config.minIntradayRangePercent = 0.0;
+    config.maxPriceChangePercent = 100.0;
+
+    zerotick::StockSelectionEngine engine(quoteUpdates, registry, output,
+                                          universe, config);
+    engine.start();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    require(output.empty(),
+            "price increase below minPriceChangePercent must be rejected");
+    require(registry.isUnassigned("TEST"),
+            "rejected low-momentum symbol should be released");
     engine.stop();
 }
 
@@ -265,11 +320,16 @@ void testSelectionWaitsUntilQuoteAvailable() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     require(output.empty(), "selection should wait while no quote is available");
 
-    quoteUpdates.push(makeQuote(150.0, 200000, 5000, 1000,
-                                149.0, 151.0, 148.0));
+    zerotick::MarketSnapshot baseline =
+        makeQuote(150.0, 200000, 5000, 1000, 149.0, 151.0, 148.0);
+    zerotick::MarketSnapshot rising =
+        makeQuote(150.15, 200000, 5000, 1000, 149.0, 151.0, 148.0);
+    rising.receivedAt = baseline.receivedAt + std::chrono::milliseconds(1);
+    quoteUpdates.push(baseline);
+    quoteUpdates.push(rising);
     zerotick::StockCandidate candidate;
     require(output.pop(candidate, std::chrono::seconds(2)),
-            "selection should process a quote after it arrives");
+            "selection should process rising quote after baseline arrives");
     engine.stop();
 }
 
@@ -357,13 +417,63 @@ void testHandlingPaperModeRoundTrip() {
     engine.stop();
 }
 
+void testQuantityUsesFullEqualSlotBudget() {
+    require(
+        zerotick::calculateQuantityWithinBudget(1000.0, 50.10) == 19,
+        "quantity should use the MIS margin requirement within one slot");
+    require(
+        zerotick::calculateQuantityWithinBudget(10.0, 17.90) == 0,
+        "an equal slot below one-share cost must not produce a quantity");
+}
+
+void testPortfolioRiskManagerLimitsAndDividesSlotsEqually() {
+    zerotick::PortfolioRiskManager risk(1000.0);
+    for (int index = 0; index < 10; ++index) {
+        double slotBudget = 0.0;
+        require(
+            risk.reserveSlot("SYMBOL" + std::to_string(index), 1000.0,
+                             slotBudget),
+            "each of ten symbols should reserve one portfolio slot");
+        require(std::abs(slotBudget - 100.0) < 0.0001,
+                "portfolio cash should be divided across ten slots");
+    }
+
+    double extraSlotBudget = 0.0;
+    require(!risk.reserveSlot("EXTRA", 1000.0, extraSlotBudget),
+            "a position beyond the ten-slot limit must be blocked");
+    risk.releaseSlot("SYMBOL0");
+    require(risk.reserveSlot("EXTRA", 1000.0, extraSlotBudget),
+            "closing a position should release its portfolio slot");
+}
+
+void testFreeCashSubtractsExistingUtilization() {
+    require(
+        std::abs(zerotick::calculateFreeCash(
+                     245431.60, 0.0, 145706.55, 99725.05) -
+                 99725.05) < 0.0001,
+        "free cash should exclude already utilized funds");
+    require(
+        zerotick::calculateFreeCash(500.0, 0.0, 600.0, 900.0) == 0.0,
+        "utilization greater than cash should leave no spendable budget");
+    require(
+        zerotick::calculateFreeCash(1000.0, 0.0, 0.0, 500.0) == 500.0,
+        "free cash should not exceed Kite's current live balance");
+    require(
+        zerotick::calculateFreeCash(0.30, 101.0, 0.0, 101.30) == 101.30,
+        "intraday payin should be included but capped at live balance");
+}
+
 void testFullPipelinePaperMode() {
-    zerotick::MarketSnapshot quote = makeQuote(150.0, 200000, 5000, 1000,
-                                               149.0, 151.0, 148.0);
+    zerotick::MarketSnapshot baseline =
+        makeQuote(150.0, 200000, 5000, 1000, 149.0, 151.0, 148.0);
+    zerotick::MarketSnapshot quote =
+        makeQuote(150.15, 200000, 5000, 1000, 149.0, 151.0, 148.0);
+    quote.receivedAt = baseline.receivedAt + std::chrono::milliseconds(1);
     FakeKiteApi api(quote);
     TestUniverse universe({"TEST"});
     zerotick::StockEngineRegistry registry;
     zerotick::ThreadSafeQueue<zerotick::MarketSnapshot> quoteUpdates;
+    quoteUpdates.push(baseline);
     quoteUpdates.push(quote);
     zerotick::ThreadSafeQueue<zerotick::StockCandidate> selectionToDecision;
     zerotick::ThreadSafeQueue<zerotick::TradeSignal> decisionToHandling;
@@ -424,11 +534,15 @@ int main() {
         testNiftyUniverseUsesCurrentNifty100Symbols();
         testRegistryOneEngineAtATime();
         testSelectionSelectsGoodStock();
+        testSelectionRejectsPriceChangeBelowMinimum();
         testSelectionRejectsLowPrice();
         testSelectionRejectsLowVolume();
         testSelectionWaitsUntilQuoteAvailable();
         testDecisionEmitsSignal();
         testHandlingPaperModeRoundTrip();
+        testQuantityUsesFullEqualSlotBudget();
+        testPortfolioRiskManagerLimitsAndDividesSlotsEqually();
+        testFreeCashSubtractsExistingUtilization();
         testFullPipelinePaperMode();
     } catch (const std::exception& exception) {
         std::cerr << "Engine test failed: " << exception.what() << '\n';

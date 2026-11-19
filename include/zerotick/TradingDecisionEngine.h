@@ -2,15 +2,12 @@
 
 #include "EngineTypes.h"
 #include "KiteApi.h"
-#include "Strategy.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstddef>
-#include <memory>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 namespace zerotick {

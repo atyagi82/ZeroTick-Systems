@@ -78,12 +78,12 @@ struct TradeOutcome {
 struct SelectionConfig {
     double minPrice = 100.0;                  // stocks above 100
     bool requireNifty100 = true;              // in NIFTY 100 universe
-    double minRelativeVolume = 1.5;           // current volume vs recent average
+    double minRelativeVolume = 1.5;           // current volume / updated EWMA
     std::uint64_t minAbsoluteVolume = 50000;  // minimum absolute volume
     double maxSpreadPercent = 0.20;           // liquidity ceiling
     double minDepthQuantity = 1000.0;         // min bid/ask book depth
-    double minPriceChangePercent = 0.05;      // some intraday momentum
-    double maxPriceChangePercent = 6.0;       // avoid circuits / excess volatility
+    double minPriceChangePercent = 0.05;      // minimum rise from previous quote
+    double maxPriceChangePercent = 6.0;       // maximum move/range in percent
     double minIntradayRangePercent = 0.30;    // enough intraday range to trade
     std::chrono::seconds summaryInterval{5};
     std::size_t workerCount = 4;
@@ -159,8 +159,9 @@ private:
 };
 
 /**
- * Bounded/unbounded multi-producer multi-consumer queue with blocking pop.
- * All engines communicate through these queues.
+ * Unbounded multi-producer, multi-consumer queue with blocking pop.
+ * Producers publish immutable pipeline events; consumers wait instead of
+ * polling. A slow consumer can accumulate queued items.
  */
 template <typename T>
 class ThreadSafeQueue {

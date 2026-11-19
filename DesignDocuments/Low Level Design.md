@@ -15,8 +15,7 @@
 | Selection | `include/zerotick/StockSelectionEngine.h`, `src/StockSelectionEngine.cpp` | Consume quote events and filter candidates |
 | Decision | `include/zerotick/TradingDecisionEngine.h`, `src/TradingDecisionEngine.cpp` | Re-check a candidate against a fresh quote and produce trade signals |
 | Execution and risk | `include/zerotick/TradeHandlingEngine.h`, `src/TradeHandlingEngine.cpp`, `include/zerotick/Risk.h` | Reserve capacity, size, execute/paper-trade, monitor exits |
-| Legacy strategy path | `src/Worker.cpp`, `src/ThreadPool.cpp`, `src/Strategy.cpp`, `src/StateMachine.cpp` | Earlier per-symbol strategy/state-machine implementation; not created by current `main` |
-| Tests | `tests/EngineTests.cpp`, `tests/StrategyTests.cpp` | Engine pipeline, strategy, risk sizing, and simulated order-flow tests |
+| Tests | `tests/EngineTests.cpp` | Engine pipeline, selection thresholds, risk sizing, and simulated order-flow tests |
 
 ## 2. Core data types
 
@@ -102,21 +101,24 @@ For each snapshot:
 | Relative volume must meet `minRelativeVolume` | 1.5 |
 | Spread must be within `maxSpreadPercent` | 0.20% |
 | Both displayed depth sides must meet `minDepthQuantity` | 1,000 |
+| Price must rise from the previous newer quote by at least `minPriceChangePercent` | 0.05% |
 | Intraday range must meet the minimum | 0.30% |
 | Intraday range and absolute price change must not exceed the maximum | 6.0% |
 
 Relative volume uses an exponentially weighted average with `alpha = 0.2`.
-The first observed volume initializes the average, so its relative volume is
-1.0. Subsequent events update the EWMA from cumulative volume snapshots.
+The average is updated from cumulative volume snapshots before computing the
+ratio, so the first observed volume has a relative volume of 1.0.
+
+Price movement compares each valid quote with the previous newer quote for
+that symbol. The first quote seeds the baseline and cannot qualify by itself.
+The baseline advances even when a later selection filter rejects the quote;
+out-of-order quote events cannot move it backward.
 
 On rejection, selection releases the symbol. On success, it pushes a
 `StockCandidate` and keeps ownership until decision claims it. Per-worker
 summary logs are emitted at the configured five-second interval while quote
 events are being processed; counts include selected symbols, stale events,
 owned-symbol skips, and rejection reasons.
-
-`SelectionConfig::minPriceChangePercent` is declared but is not currently
-checked by `evaluateSelection`.
 
 ## 5. Decision worker
 
@@ -184,8 +186,8 @@ When `liveTrading` is true:
 5. Release slot and symbol when the attempt terminates.
 
 Target/stop management is in-process; no broker-hosted OCO/bracket order is
-created. The Kite adapter also exposes `estimateMisOrderFunds`, but the current
-`TradeHandlingEngine` sizing path does not call it.
+created. Order quantity is sized from the risk manager's per-position cash
+slot; the current handling path does not request a broker margin estimate.
 
 In the current `main`, `PortfolioRiskManager` is initialized from live startup
 cash only when live mode is enabled. In paper mode that value remains zero,
@@ -203,7 +205,6 @@ this CLI configuration gap.
 | Fresh quote read | In-memory cache lookup with a five-second receipt-age limit |
 | Live preflight | `/portfolio/positions` and `/orders`; block on existing MIS exposure for universe symbols |
 | Cash | `/user/margins/equity`; free cash is validated and adjusted for utilization |
-| MIS margin estimate | `/margins/orders` |
 | Entry and exit | `/orders/regular` with MIS stop-limit buy and limit sell |
 | Order status | `/orders/{order_id}` |
 | Cancellation | Kite order-cancel endpoint |
@@ -238,9 +239,9 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 `engine_tests` covers the 100-symbol universe, ownership transitions, event
-waiting, selection filtering, decision signal generation, paper handling, and
-an end-to-end paper-mode pipeline. `strategy_tests` covers the older
-`OrderImbalanceStrategy`/`Worker` path and risk/order-flow cases.
+waiting, selection filtering and price-change thresholds, decision signal
+generation, portfolio sizing/cash calculations, paper handling, and an
+end-to-end paper-mode pipeline.
 
 ## 10. Related documents
 

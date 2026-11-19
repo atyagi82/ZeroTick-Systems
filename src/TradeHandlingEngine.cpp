@@ -91,6 +91,8 @@ bool TradeHandlingEngine::waitForEntryFill(const std::string& orderId,
                                            BrokerOrderStatus& status) const {
     const auto deadline =
         std::chrono::steady_clock::now() + config_.entryFillTimeout;
+    // Transient status failures do not imply an order was rejected; keep
+    // polling until it becomes terminal or the configured deadline expires.
     while (!stopRequested_.load() &&
            std::chrono::steady_clock::now() < deadline) {
         try {
@@ -140,6 +142,8 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
     outcome.filledQuantity = quantity;
 
     if (!config_.liveTrading) {
+        // Paper mode is a deterministic pipeline check, not a market replay:
+        // it records an entry and immediately models an exit at the target.
         outcome.exited = true;
         outcome.exitPrice = signal.targetPrice;
         outcome.stopLoss = false;
@@ -155,6 +159,7 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
 
     OrderResult exitOrder;
     try {
+        // The target is a broker limit order; stop monitoring remains local.
         exitOrder = api_.placeLimitExit(symbol, quantity, signal.targetPrice);
     } catch (const std::exception& exception) {
         zerotick::logLine(
@@ -198,6 +203,7 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
                 snapshot.lastPrice <= signal.stopLossPrice && !stopLoss) {
                 stopLoss = true;
                 try {
+                    // Replace the target order with an exit at the stop level.
                     api_.cancelOrder(activeExitOrderId);
                 } catch (const std::exception&) {
                 }
@@ -258,6 +264,8 @@ void TradeHandlingEngine::handleSignal(const TradeSignal& signal) {
         return;
     }
 
+    // Reserve capacity before sizing so concurrent handlers cannot overbook
+    // the same slot; never exceed the signal's indicative quantity either.
     int quantity = zerotick::calculateQuantityWithinBudget(
         slotBudget, signal.entryLimitPrice > 0.0 ? signal.entryLimitPrice
                                                  : signal.entryTriggerPrice);

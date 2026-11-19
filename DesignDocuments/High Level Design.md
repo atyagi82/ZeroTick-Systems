@@ -10,10 +10,8 @@ ZeroTick-Systems is a Windows C++ application that retrieves NSE market data
 from Zerodha Kite Connect, filters a configured stock universe, evaluates
 potential long entries, and optionally submits and manages MIS orders.
 
-This document describes the runtime wired by `src/main.cpp`. The older
-`Worker`/`ThreadPool` strategy path remains in the library and is exercised by
-some strategy tests, but it is not instantiated by the current application
-entry point.
+This document describes the event-driven runtime wired by `src/main.cpp`:
+quote delivery, stock selection, trade decisions, and trade handling.
 
 The application is a prototype, not a production trading system. Live orders
 are opt-in, and live-market behavior, exchange-hour handling, and complete
@@ -142,7 +140,88 @@ failed quote checks, and completed or abandoned handling attempts release
 ownership. This prevents two engine stages from processing the same symbol at
 the same time.
 
-## 6. Trading modes and safety boundary
+## 6. Selection and decision algorithms
+
+The selection and decision stages are long-only gates: selection narrows fresh
+market snapshots to candidates, then decision rechecks each candidate before
+creating a buy signal. Neither stage submits orders; execution and risk checks
+remain in `TradeHandlingEngine`.
+
+### Stock selection
+
+Selection ignores snapshots older than five seconds and applies these default
+filters in order:
+
+| Gate | Default |
+|---|---:|
+| Last price must be greater than the minimum | 100 |
+| Symbol must belong to the configured universe | NIFTY 100 required |
+| Cumulative session volume | At least 50,000 |
+| Relative volume | At least 1.5 |
+| Best bid/ask spread | No more than 0.20% |
+| Displayed bid and ask depth | At least 1,000 on each side |
+| Change from previous newer quote | At least +0.05% |
+| Intraday high/low range | 0.30% to 6.0% |
+| Absolute change from previous quote | No more than 6.0% |
+
+The volume baseline is an EWMA of cumulative quote-volume samples with
+`alpha = 0.2`:
+
+```text
+average_t      = 0.2 * volume_t + 0.8 * average_(t-1)
+relativeVolume = volume_t / average_t
+```
+
+The current sample is included in the EWMA before computing the ratio, so the
+first sample has relative volume 1.0. This is a comparison of successive
+cumulative-volume snapshots, not a time-normalized or historical-volume
+profile.
+
+Price movement is computed from the last price and receipt time of the
+previous newer quote for that symbol:
+
+```text
+priceChangePercent = (last_t - last_(t-1)) / last_(t-1) * 100
+rangePercent       = (high - low) / low * 100
+spreadPercent      = (ask - bid) / ((ask + bid) / 2) * 100
+```
+
+The first valid quote seeds the price baseline and cannot pass the +0.05%
+movement gate by itself. A newer quote advances the baseline even when another
+selection filter rejects it; an out-of-order quote cannot move that baseline
+backward. A candidate is sent to decision only after all selection gates pass.
+
+### Trade decision
+
+For each candidate, decision reads a cached quote no older than five seconds
+and requires:
+
+- Fresh spread no greater than **0.10%**.
+- Candidate relative volume of at least **1.2** when volume confirmation is
+  enabled (enabled by default).
+- Weighted bid-side imbalance of at least **+0.05**.
+- Fresh last price not below the candidate's selected price.
+
+The five-level imbalance weights nearer levels more heavily:
+
+```text
+imbalance = (sum(weight_i * bidQty_i) - sum(weight_i * askQty_i))
+            / sum(weight_i * (bidQty_i + askQty_i))
+weights   = [1.0, 0.8, 0.6, 0.4, 0.2]
+```
+
+If these checks pass, decision creates a long `TradeSignal`; it does not place
+an order. Tick size is inferred from adjacent depth prices, with `0.01` as a
+fallback. The entry trigger is one tick above the rounded-up greater of last
+price and best ask; the limit is one more tick above the trigger. Defaults set
+the target to **+0.20%** and the stop to **-0.40%** from the entry limit.
+Decision attaches an indicative quantity based on a fixed 50,000 budget;
+handling recalculates quantity against the portfolio slot and may reject it.
+
+The current decision stage evaluates one fresh quote per candidate; it does
+not wait for multiple-snapshot confirmation.
+
+## 7. Trading modes and safety boundary
 
 - **Default mode:** `liveTrading` is false; no broker orders are submitted by
   `TradeHandlingEngine`.
@@ -155,7 +234,7 @@ the same time.
 - The portfolio guard is an in-memory cap, not a daily-loss limit or a durable
   order ledger.
 
-## 7. Deployment and build
+## 8. Deployment and build
 
 The current transport is Windows-only and uses C++14. CMake fetches
 `nlohmann/json`.
@@ -175,7 +254,7 @@ Run from the repository root so `.env` can be loaded:
 `--login` forces a fresh browser login. `--enable-live-trading` is a separate
 explicit option that can submit real orders.
 
-## 8. Current limitations
+## 9. Current limitations
 
 - The NIFTY 100 membership is a checked-in snapshot sourced from the NSE list
   dated 2026-11-19; it does not refresh automatically on index rebalance.
@@ -184,12 +263,12 @@ explicit option that can submit real orders.
   last changed the market data.
 - The relative-volume filter compares cumulative volume with an EWMA updated
   on each quote event. This can stay near 1.0 when volume is not increasing.
+- Quote-to-quote movement uses local receipt order, not exchange event time.
 - Paper and live behavior are covered by fakes/unit tests, not by a complete
   market replay or end-to-end live-order validation.
-- Several older strategy/worker components remain compiled, so the active
-  runtime should be traced from `src/main.cpp` rather than inferred from every
-  source file in the library.
+- The previous per-symbol worker pipeline has been removed. The active runtime
+  is the selection, decision, and handling pipeline described above.
 
-## 9. Related documents
+## 10. Related documents
 
 - [Low-Level Design](./Low%20Level%20Design.md)
