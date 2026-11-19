@@ -119,7 +119,7 @@ For Kite's five bid and ask levels, the strategy applies weights `1.0, 0.8, 0.6,
 It exits at a `+0.20%` price move from entry or a `-0.40%` move. Before fees and slippage, that target/stop ratio requires a win rate above approximately `66.7%` to break even. This is not a forecast; success probability must be measured using historical order-book data and realistic transaction costs. Live order placement remains explicitly disabled in the Kite adapter.
 
 
-19th November First Testing
+## 19th November First Testing
 
 Release\zerotick.exe --login
 Starting Kite login in your browser...
