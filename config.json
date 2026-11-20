@@ -1,0 +1,52 @@
+{
+  "allow_short_selling": false,
+  "market_data": {
+    "quote_poll_interval_ms": 1000,
+    "quote_max_age_seconds": 5,
+    "fallback_tick_size": 0.01
+  },
+  "selection": {
+    "min_price": 100.0,
+    "require_nifty100": true,
+    "min_relative_volume": 1,
+    "min_absolute_volume": 50000,
+    "max_spread_percent": 0.0,
+    "min_depth_quantity": 1000.0,
+    "min_price_change_percent": 0.05,
+    "max_price_change_percent": 6.0,
+    "min_intraday_range_percent": 0.3,
+    "volume_ewma_alpha": 0.2,
+    "summary_interval_seconds": 5,
+    "worker_count": 4
+  },
+  "decision": {
+    "minimum_imbalance": 0.05,
+    "maximum_spread_percent": 0.05,
+    "target_percent": 0.50,
+    "stop_percent": 0.20,
+    "require_volume_confirmation": true,
+    "min_relative_volume": 1.2,
+    "indicative_entry_budget": 50000.0,
+    "imbalance_level_weights": [1.0, 0.8, 0.6, 0.4, 0.2],
+    "entry_trigger_offset_ticks": 1,
+    "entry_limit_offset_ticks": 1,
+    "worker_count": 4
+  },
+  "handling": {
+    "poll_interval_ms": 1000,
+    "entry_fill_timeout_seconds": 30,
+    "exit_fill_timeout_seconds": 30,
+    "worker_count": 10
+  },
+  "risk": {
+    "max_open_positions": 100,
+    "paper_trading_cash": 1000000.0
+  },
+  "backtest": {
+    "initial_capital": 1000000.0,
+    "max_open_positions": 20,
+    "entry_timeout_minutes": 5,
+    "entry_start_time": "10:00",
+    "entry_end_time": "13:00"
+  }
+}
