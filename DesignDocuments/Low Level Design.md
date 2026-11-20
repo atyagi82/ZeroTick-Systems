@@ -67,8 +67,12 @@ but stale queue entries still have to be drained.
 
 ## 3. Startup, quote delivery, and shutdown
 
-1. `main` accepts `--login`, `--enable-live-trading`, `--backtest`,
-   `--optimize-100-days`, and `--capital`; unknown flags fail startup.
+1. `main` accepts `--login`, `--enable-live-trading`, `--enable-shorts`,
+   `--config <path>`, `--backtest`, `--optimize-100-days`, and `--capital`;
+   unknown flags fail startup. It loads and validates the JSON runtime
+   configuration before authenticating. `allow_short_selling` in the file or
+   `--enable-shorts` can opt in to short selling; live order submission still
+   requires `--enable-live-trading`.
 2. `KiteConnectApi` reads API credentials from `.env`, with environment
    variables taking precedence. If forced or no access token exists, it uses a
    browser login and a local callback listener, exchanges the request token,
@@ -93,9 +97,19 @@ When `--backtest YYYY-MM-DD` is supplied, `main` branches before starting the
 live quote poller or trading engines. It loads the NSE equity instrument dump
 to resolve tokens and tick sizes, then requests one-minute candles for the
 NIFTY 100 symbols from 09:15 to 15:30. Calls are spaced 400 ms apart. The
-default capital is 10,000; `--capital` overrides it. Closed trades are printed
-in a text table, and the final summary line reports total profit or loss. Live
-trading is rejected in backtest mode.
+configured backtest capital defaults to 10,000; `--capital` overrides it.
+Closed trades are printed in a text table, and the final summary line reports
+total profit or loss. Live trading is rejected in backtest mode.
+
+`config.json` is the operator-editable source for selection thresholds and
+volume smoothing, decision thresholds and book-imbalance weights, quote
+freshness, entry tick offsets, target/stop settings, worker counts and polling
+intervals, fill timeouts, position and paper-cash limits, short-selling
+opt-in, and backtest capital, tick-size fallback, and entry-time window.
+Missing keys retain compiled defaults; unknown keys, malformed values, and
+invalid ranges fail startup. Changes are read once when the executable starts,
+not hot-reloaded. The file path is relative to the process working directory
+unless an explicit `--config` path is provided.
 
 ## 4. Selection worker
 
@@ -116,7 +130,7 @@ For each snapshot:
 | Relative volume must meet `minRelativeVolume` | 1.5 |
 | Spread must be within `maxSpreadPercent` | 0.20% |
 | Both displayed depth sides must meet `minDepthQuantity` | 1,000 |
-| Price must rise from the previous newer quote by at least `minPriceChangePercent` | 0.05% |
+| Price must move in the selected direction from the previous newer quote by at least `minPriceChangePercent` | 0.05% |
 | Intraday range must meet the minimum | 0.30% |
 | Intraday range and absolute price change must not exceed the maximum | 6.0% |
 
@@ -135,6 +149,12 @@ summary logs are emitted at the configured five-second interval while quote
 events are being processed; counts include selected symbols, stale events,
 owned-symbol skips, and rejection reasons.
 
+Short candidates require `allowShortSelling`; otherwise downward momentum is
+rejected. The same setting is required independently by decision and handling,
+so a short signal cannot reach an order submission path unless all stages were
+explicitly configured. Runtime config sets all three guards; `--enable-shorts`
+is an additional CLI opt-in.
+
 ## 5. Historical candle replay
 
 `BacktestEngine` accepts historical candles grouped by symbol and replays
@@ -147,18 +167,31 @@ confirmation is retained, but its spread and weighted-imbalance checks are
 omitted. The decision non-falling-price recheck is effectively tautological:
 the candle close serves as both the candidate price and the decision price.
 
-A signal is formed at the bar close. Its entry is tested only on the next
-available bar: the high must reach the trigger and the open must not gap above
-the limit. An unfilled entry is canceled after that one-bar window; this is
-not equivalent to the live 30-second timeout and can leave an order eligible
-for up to a full minute. Stop/target checks start on later bars. If a bar
-touches both, stop-loss is assumed first; gaps use the bar open as the
+A signal is formed at the bar close. Long entries require a later bar's high
+to reach the trigger without opening above the limit; short entries require a
+later bar's low to reach the trigger without opening below the limit. An
+unfilled entry remains pending for `backtest.entry_timeout_minutes` (five
+minutes by default), is checked on each subsequent minute candle, and is
+canceled when it fills, times out, or the entry window closes. This is separate
+from the live 30-second order timeout. Stop/target checks start after entry. If
+a bar touches both, stop-loss is assumed first; gaps use the bar open as the
 simulated fill. Remaining positions are closed at each symbol's final
 available close.
 
-The risk model reserves at most ten positions, with each slot capped at
-`initialCapital / 10` and available cash. With 10,000 initial capital, the
-default slot is 1,000. P&L is gross and excludes fees, taxes, and slippage.
+The default backtest entry window is `[12:00, 13:00)` NSE time. Signals and
+pending-entry fills are rejected outside this window; historical candles still
+update price, volume, and range state. Existing positions continue to be
+checked against their exits and are closed at end of day. The 100-day optimizer
+uses the same window. This time filter is a proxy for avoiding the opening
+period, not a direct measurement of volatility; live trading is unaffected.
+
+The backtest reserves at most `backtest.max_open_positions` positions, with
+each slot capped at `initialCapital / max_open_positions` and available cash.
+The default cap is ten, so 10,000 initial capital yields 1,000 per slot. The
+live/paper pipeline uses the separate `risk.max_open_positions` setting. This
+is a concurrent-position limit, not a daily trade-count limit; the backtest
+does not currently cap the number of sequential trades per day.
+P&L is gross and excludes fees, taxes, and slippage.
 The console table includes each closed trade's signal/entry/exit time, prices,
 quantity, exit reason, and gross P&L. The final summary line prints total P&L.
 Current NIFTY 100 membership is used for all dates, so this is not point-in-time
@@ -188,21 +221,28 @@ Each `TradingDecisionEngine` worker blocks on the candidate queue:
 4. If volume confirmation is enabled, require candidate relative volume of at
    least 1.2.
 5. Compute weighted book imbalance using weights `1.0, 0.8, 0.6, 0.4, 0.2`
-   for levels 1 through 5, and require at least `+0.05`.
-6. Reject if the fresh last price is below the selected price.
+   for levels 1 through 5. Longs require at least `+0.05`; shorts require at
+   most `-0.05` and must pass the short-selling opt-in.
+6. Reject if price moves against the selected side since selection.
 7. Infer tick size from adjacent depth prices, rounded to paise; use `0.01`
    when no step can be inferred.
-8. Calculate:
+8. For a long, place a buy stop-limit above the ask and set target/stop above
+   and below entry. For a short, place a sell stop-limit below the bid and set
+   target/stop below and above entry:
 
 ```text
-triggerBase = max(fresh.lastPrice, fresh.askPrice)
-trigger     = roundUpToTick(triggerBase, tick) + tick
-limit       = trigger + tick
-target      = limit * (1 + targetPercent / 100)
-stop        = limit * (1 - stopPercent / 100)
+long:  triggerBase = max(fresh.lastPrice, fresh.askPrice)
+       trigger     = roundUpToTick(triggerBase, tick) + tick
+       limit       = trigger + tick
+       target/stop = limit * (1 +/- percentage / 100)
+
+short: triggerBase = min(fresh.lastPrice, fresh.bidPrice)
+       trigger     = roundDownToTick(triggerBase, tick) - tick
+       limit       = trigger - tick
+       target/stop = limit * (1 -/+ percentage / 100)
 ```
 
-The defaults are a 0.40% target and 0.20% stop. The signal quantity is an
+The defaults are a 0.30% target and 0.40% stop. The signal quantity is an
 indicative cap derived from a fixed 50,000 budget divided by entry limit; final
 quantity is recalculated by handling.
 
@@ -226,7 +266,11 @@ and is capped by the decision signal quantity.
 
 When `liveTrading` is false, handling uses a 100,000 free-cash value, marks the
 entry at the signal limit, simulates a target exit, then releases the slot and
-symbol. No Kite orders are submitted.
+symbol. No Kite orders are submitted. For live positions, a long enters with a
+buy and exits with a sell; a short enters with a sell and exits with a buy to
+cover. The `allowShortSelling` handling guard is a final check before order
+submission. Broker-specific short margin requirements are not estimated by the
+share-count sizing helper.
 
 ### Live path
 

@@ -2,6 +2,7 @@
 
 #include "Types.h"
 
+#include <chrono>
 #include <map>
 #include <mutex>
 #include <set>
@@ -31,7 +32,9 @@ class KiteApi {
 public:
     virtual ~KiteApi() = default;
 
-    virtual MarketSnapshot getQuote(const std::string& symbol) = 0;
+    virtual MarketSnapshot getQuote(
+        const std::string& symbol,
+        std::chrono::seconds maxAge = std::chrono::seconds(5)) = 0;
     virtual std::vector<MarketSnapshot> refreshQuotes(
         const std::vector<std::string>& symbols) = 0;
     virtual void ensureNoOpenMisExposure(
@@ -41,11 +44,13 @@ public:
         const std::string& symbol,
         int quantity,
         double triggerPrice,
-        double limitPrice) = 0;
+        double limitPrice,
+        PositionSide side) = 0;
     virtual OrderResult placeLimitExit(
         const std::string& symbol,
         int quantity,
-        double limitPrice) = 0;
+        double limitPrice,
+        PositionSide positionSide) = 0;
     virtual BrokerOrderStatus getOrderStatus(
         const std::string& orderId) = 0;
     virtual void cancelOrder(const std::string& orderId) = 0;
@@ -60,7 +65,9 @@ class KiteConnectApi : public KiteApi {
 public:
     explicit KiteConnectApi(bool forceLogin = false);
 
-    MarketSnapshot getQuote(const std::string& symbol) override;
+    MarketSnapshot getQuote(
+        const std::string& symbol,
+        std::chrono::seconds maxAge = std::chrono::seconds(5)) override;
     std::vector<MarketSnapshot> refreshQuotes(
         const std::vector<std::string>& symbols) override;
     void ensureNoOpenMisExposure(
@@ -70,11 +77,13 @@ public:
         const std::string& symbol,
         int quantity,
         double triggerPrice,
-        double limitPrice) override;
+        double limitPrice,
+        PositionSide side) override;
     OrderResult placeLimitExit(
         const std::string& symbol,
         int quantity,
-        double limitPrice) override;
+        double limitPrice,
+        PositionSide positionSide) override;
     BrokerOrderStatus getOrderStatus(
         const std::string& orderId) override;
     void cancelOrder(const std::string& orderId) override;

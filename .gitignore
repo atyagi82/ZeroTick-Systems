@@ -8,3 +8,6 @@
 
 # Backtest and other local CSV output
 *.csv
+
+# Runtime diagnostic log
+logs.txt

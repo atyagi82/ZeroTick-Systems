@@ -51,7 +51,6 @@ private:
     bool waitForExitFill(const std::string& orderId,
                          BrokerOrderStatus& status) const;
     double roundUpToTick(double price, double tick) const;
-    double priceTick(const MarketSnapshot& snapshot) const;
 
     KiteApi& api_;
     StockEngineRegistry& registry_;

@@ -23,6 +23,8 @@ add_library(zerotick_core
     src/BacktestEngine.cpp
     src/KiteConnectApi.cpp
     src/EngineTypes.cpp
+    src/Log.cpp
+    src/RuntimeConfig.cpp
     src/StockSelectionEngine.cpp
     src/TradingDecisionEngine.cpp
     src/TradeHandlingEngine.cpp
@@ -41,4 +43,8 @@ if(BUILD_TESTING)
     add_executable(engine_tests tests/EngineTests.cpp)
     target_link_libraries(engine_tests PRIVATE zerotick_core)
     add_test(NAME engine_tests COMMAND engine_tests)
+    set_tests_properties(
+        engine_tests
+        PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
 endif()

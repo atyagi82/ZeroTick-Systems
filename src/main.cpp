@@ -2,6 +2,7 @@
 #include "zerotick/BacktestEngine.h"
 #include "zerotick/Log.h"
 #include "zerotick/EngineTypes.h"
+#include "zerotick/RuntimeConfig.h"
 #include "zerotick/StockSelectionEngine.h"
 #include "zerotick/TradingDecisionEngine.h"
 #include "zerotick/TradeHandlingEngine.h"
@@ -92,6 +93,7 @@ downloadBacktestCandles(
 void printBacktestSummary(
     const std::string& date,
     std::size_t symbolsWithoutData,
+    const zerotick::BacktestConfig& config,
     const zerotick::BacktestResult& result) {
     std::size_t winningTrades = 0;
     for (const zerotick::BacktestTrade& trade : result.trades) {
@@ -115,10 +117,20 @@ void printBacktestSummary(
 
     std::cout << std::fixed << std::setprecision(2)
               << "Backtest date: " << date << " (Kite 1-minute candles)\n"
+              << "New-entry window (NSE time): [" << config.entryStartTime
+              << ", " << config.entryEndTime
+              << "); open positions remain managed after the window.\n"
+              << "Backtest position cap: " << config.maxOpenPositions
+              << "; starting slot budget: INR "
+              << config.initialCapital /
+                     static_cast<double>(config.maxOpenPositions)
+              << "; pending-entry timeout: "
+              << config.entryTimeoutMinutes << " minute(s)\n"
               << "\nClosed trades (times shown as HH:MM):\n"
               << std::left
               << std::setw(4) << "#"
               << std::setw(13) << "Symbol"
+              << std::setw(8) << "Side"
               << std::setw(8) << "Signal"
               << std::setw(8) << "Entry"
               << std::setw(8) << "Exit"
@@ -128,7 +140,7 @@ void printBacktestSummary(
               << std::setw(12) << "Sell price"
               << std::setw(12) << "Gross P&L"
               << "  " << std::left << "Exit reason" << '\n'
-              << std::string(96, '-') << '\n';
+              << std::string(104, '-') << '\n';
 
     if (result.trades.empty()) {
         std::cout << "No closed trades.\n";
@@ -138,6 +150,10 @@ void printBacktestSummary(
         std::cout << std::left
                   << std::setw(4) << index + 1
                   << std::setw(13) << trade.symbol
+                  << std::setw(8)
+                  << (trade.side == zerotick::PositionSide::Short
+                          ? "SHORT"
+                          : "LONG")
                   << std::setw(8) << sessionTime(trade.signalTime)
                   << std::setw(8) << sessionTime(trade.entryTime)
                   << std::setw(8) << sessionTime(trade.exitTime)
@@ -157,7 +173,11 @@ void printBacktestSummary(
               << "Signals: " << result.generatedSignals
               << ", filled entries: " << result.filledEntries
               << ", unfilled entries: " << result.unfilledEntries
-              << ", risk rejected: " << result.riskRejectedSignals << "\n"
+              << ", risk rejected: " << result.riskRejectedSignals
+              << " (position cap: "
+              << result.positionLimitRejectedSignals
+              << ", insufficient slot budget: "
+              << result.insufficientBudgetRejectedSignals << ")\n"
               << "Closed trades: " << result.trades.size()
               << ", winners: " << winningTrades
               << ", win rate: " << winRate << "%\n"
@@ -285,7 +305,7 @@ std::vector<OptimizationVariant> makeOptimizationVariants(
     };
     const ExitProfile exitProfiles[] = {
         {0.20, 0.40},
-        {0.30, 0.20},
+        {0.30, 0.40},
         {0.40, 0.20},
         {0.40, 0.30}
     };
@@ -307,7 +327,7 @@ std::vector<OptimizationVariant> makeOptimizationVariants(
                 selection.relativeVolume == 1.5 &&
                 selection.priceChange == 0.05 &&
                 selection.intradayRange == 0.30 &&
-                exits.target == 0.40 && exits.stop == 0.20;
+                exits.target == 0.30 && exits.stop == 0.40;
             variant.initialCapital = baseConfig.initialCapital;
             variant.capital = baseConfig.initialCapital;
             variants.push_back(variant);
@@ -348,7 +368,8 @@ double profitFactor(const SegmentStats& stats) {
 void printOptimizationResults(
     const std::vector<OptimizationVariant>& variants,
     std::size_t trainingDays,
-    std::size_t holdoutDays) {
+    std::size_t holdoutDays,
+    const zerotick::BacktestConfig& config) {
     std::vector<std::size_t> ranking;
     for (std::size_t index = 0; index < variants.size(); ++index) {
         ranking.push_back(index);
@@ -361,6 +382,8 @@ void printOptimizationResults(
 
     std::cout << std::fixed << std::setprecision(2)
               << "\n100-session parameter sweep (ranked by training P&L)\n"
+              << "New-entry window (NSE time): [" << config.entryStartTime
+              << ", " << config.entryEndTime << ")\n"
               << "Training sessions: " << trainingDays
               << ", untouched holdout sessions: " << holdoutDays << '\n'
               << std::left
@@ -593,7 +616,8 @@ void runOptimizationStudy(
         }
     }
 
-    printOptimizationResults(variants, trainingDays, holdoutDays);
+    printOptimizationResults(
+        variants, trainingDays, holdoutDays, baseConfig);
     zerotick::logLine(
         "[optimization] symbols_without_any_data=" +
         std::to_string(symbols.size() - symbolsWithData.size()));
@@ -606,19 +630,33 @@ int main(int argumentCount, char* arguments[]) {
     std::signal(SIGTERM, handleSignal);
 
     try {
+        zerotick::initializeLogFile();
+        zerotick::logLine("[app] startup");
         bool forceLogin = false;
         bool liveTrading = false;
+        bool shortSelling = false;
         bool backtest = false;
         bool optimize100Days = false;
         bool capitalProvided = false;
+        bool configPathProvided = false;
         std::string backtestDate;
-        zerotick::BacktestConfig backtestConfig;
+        std::string configPath = "config.json";
+        double requestedCapital = 0.0;
         for (int index = 1; index < argumentCount; ++index) {
             std::string argument(arguments[index]);
             if (argument == "--login") {
                 forceLogin = true;
             } else if (argument == "--enable-live-trading") {
                 liveTrading = true;
+            } else if (argument == "--enable-shorts") {
+                shortSelling = true;
+            } else if (argument == "--config") {
+                if (configPathProvided || index + 1 >= argumentCount) {
+                    throw std::invalid_argument(
+                        "--config requires one configuration file path");
+                }
+                configPath = arguments[++index];
+                configPathProvided = true;
             } else if (argument == "--backtest") {
                 if (backtest || index + 1 >= argumentCount) {
                     throw std::invalid_argument(
@@ -639,11 +677,10 @@ int main(int argumentCount, char* arguments[]) {
                 }
                 const std::string amount = arguments[++index];
                 std::size_t parsedLength = 0;
-                backtestConfig.initialCapital =
-                    std::stod(amount, &parsedLength);
+                requestedCapital = std::stod(amount, &parsedLength);
                 if (parsedLength != amount.size() ||
-                    !std::isfinite(backtestConfig.initialCapital) ||
-                    backtestConfig.initialCapital <= 0.0) {
+                    !std::isfinite(requestedCapital) ||
+                    requestedCapital <= 0.0) {
                     throw std::invalid_argument(
                         "--capital requires a positive numeric amount");
                 }
@@ -670,11 +707,31 @@ int main(int argumentCount, char* arguments[]) {
                 "--capital can only be used with historical analysis");
         }
 
+        zerotick::RuntimeConfig runtimeConfig =
+            zerotick::loadRuntimeConfig(configPath);
+        if (capitalProvided) {
+            runtimeConfig.backtest.initialCapital = requestedCapital;
+        }
+        const bool allowShortSelling =
+            runtimeConfig.allowShortSelling || shortSelling;
+        runtimeConfig.selection.allowShortSelling = allowShortSelling;
+        runtimeConfig.decision.allowShortSelling = allowShortSelling;
+        runtimeConfig.handling.allowShortSelling = allowShortSelling;
+        runtimeConfig.handling.liveTrading = liveTrading;
+        runtimeConfig.backtest.selection = runtimeConfig.selection;
+        runtimeConfig.backtest.decision = runtimeConfig.decision;
+        zerotick::logLine(
+            "[config] loaded=" + configPath +
+            " short_selling=" +
+            (allowShortSelling ? "enabled" : "disabled") +
+            " max_positions=" +
+            std::to_string(runtimeConfig.maxOpenPositions));
+
         zerotick::KiteConnectApi kiteApi(forceLogin);
 
         zerotick::NiftyUniverse universe;
         if (optimize100Days) {
-            runOptimizationStudy(kiteApi, universe, backtestConfig);
+            runOptimizationStudy(kiteApi, universe, runtimeConfig.backtest);
             return 0;
         }
         if (backtest) {
@@ -691,9 +748,10 @@ int main(int argumentCount, char* arguments[]) {
 
             zerotick::BacktestEngine engine;
             const zerotick::BacktestResult result = engine.run(
-                universe, candles, tickSizes, backtestConfig);
+                universe, candles, tickSizes, runtimeConfig.backtest);
             printBacktestSummary(
-                backtestDate, symbolsWithoutData, result);
+                backtestDate, symbolsWithoutData,
+                runtimeConfig.backtest, result);
             return 0;
         }
 
@@ -710,31 +768,27 @@ int main(int argumentCount, char* arguments[]) {
                 std::to_string(symbols.size()) +
                 " cash_budget=" + std::to_string(totalAvailableCash) +
                 " max_positions=" +
-                std::to_string(zerotick::kMaximumLivePositions) +
-                " product=MIS");
+                std::to_string(runtimeConfig.maxOpenPositions) +
+                " product=MIS short_selling=" +
+                (allowShortSelling ? "enabled" : "disabled"));
         }
 
         zerotick::PortfolioRiskManager portfolioRisk(
-            totalAvailableCash, zerotick::kMaximumLivePositions);
+            totalAvailableCash, runtimeConfig.maxOpenPositions);
 
         zerotick::ThreadSafeQueue<zerotick::StockCandidate> selectionToDecision;
         zerotick::ThreadSafeQueue<zerotick::TradeSignal> decisionToHandling;
         zerotick::StockEngineRegistry registry;
 
-        zerotick::SelectionConfig selectionConfig;
-        zerotick::DecisionConfig decisionConfig;
-        zerotick::HandlingConfig handlingConfig;
-        handlingConfig.liveTrading = liveTrading;
-
         zerotick::StockSelectionEngine selectionEngine(
             quoteUpdates, registry, selectionToDecision, universe,
-            selectionConfig);
+            runtimeConfig.selection);
         zerotick::TradingDecisionEngine decisionEngine(
             kiteApi, registry, selectionToDecision, decisionToHandling,
-            decisionConfig);
+            runtimeConfig.decision);
         zerotick::TradeHandlingEngine handlingEngine(
             kiteApi, registry, decisionToHandling, portfolioRisk,
-            handlingConfig);
+            runtimeConfig.handling);
 
         selectionEngine.start();
         decisionEngine.start();
@@ -742,7 +796,7 @@ int main(int argumentCount, char* arguments[]) {
 
         std::thread quotePoller([&] {
             while (!shutdownRequested.load()) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                std::this_thread::sleep_for(runtimeConfig.quotePollInterval);
                 if (shutdownRequested.load()) {
                     break;
                 }
@@ -775,6 +829,8 @@ int main(int argumentCount, char* arguments[]) {
                 registry.countInEngine(zerotick::EngineId::Decision) +
                 registry.countInEngine(zerotick::EngineId::Handling)));
     } catch (const std::exception& exception) {
+        zerotick::logLine(
+            std::string("[app] fatal_error=\"") + exception.what() + "\"");
         std::cerr << "Fatal error: " << exception.what() << "\n";
         return 1;
     }

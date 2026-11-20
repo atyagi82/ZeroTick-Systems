@@ -2,6 +2,7 @@
 
 #include "Types.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -39,6 +40,7 @@ inline const char* engineIdToString(EngineId id) {
 /** A stock that passed selection and is offered to the trading decision engine. */
 struct StockCandidate {
     std::string symbol;
+    PositionSide side = PositionSide::Long;
     double lastPrice = 0.0;
     std::uint64_t volume = 0;
     double relativeVolume = 0.0;
@@ -54,6 +56,7 @@ struct StockCandidate {
 /** A trade decision handed to the trade handling engine for execution. */
 struct TradeSignal {
     std::string symbol;
+    PositionSide side = PositionSide::Long;
     int quantity = 0;
     double entryTriggerPrice = 0.0;
     double entryLimitPrice = 0.0;
@@ -78,24 +81,33 @@ struct TradeOutcome {
 struct SelectionConfig {
     double minPrice = 100.0;                  // stocks above 100
     bool requireNifty100 = true;              // in NIFTY 100 universe
+    bool allowShortSelling = false;           // explicit opt-in for short signals
     double minRelativeVolume = 1.5;           // current volume / updated EWMA
     std::uint64_t minAbsoluteVolume = 50000;  // minimum absolute volume
     double maxSpreadPercent = 0.20;           // liquidity ceiling
     double minDepthQuantity = 1000.0;         // min bid/ask book depth
-    double minPriceChangePercent = 0.05;      // minimum rise from previous quote
+    double minPriceChangePercent = 0.05;      // minimum directional move
     double maxPriceChangePercent = 6.0;       // maximum move/range in percent
     double minIntradayRangePercent = 0.30;    // enough intraday range to trade
+    double volumeEwmaAlpha = 0.2;
+    std::chrono::seconds maxQuoteAge{5};
     std::chrono::seconds summaryInterval{5};
     std::size_t workerCount = 4;
-    double defaultEntryBudget = 50000.0;      // indicative cash per candidate
 };
 
 /** Configuration for the TradingDecisionEngine. */
 struct DecisionConfig {
-    double minimumImbalance = 0.05;           // weighted bid-side imbalance
+    bool allowShortSelling = false;           // short entries require explicit opt-in
+    double minimumImbalance = 0.05;           // directional weighted imbalance
     double maximumSpreadPercent = 0.10;
-    double targetPercent = 0.40;              // profit target percent
-    double stopPercent = 0.20;                // stop loss percent
+    double targetPercent = 0.30;              // profit target percent
+    double stopPercent = 0.40;                // stop loss percent
+    double indicativeEntryBudget = 50000.0;
+    std::array<double, 5> imbalanceLevelWeights{{1.0, 0.8, 0.6, 0.4, 0.2}};
+    double fallbackTickSize = 0.01;
+    std::size_t entryTriggerOffsetTicks = 1;
+    std::size_t entryLimitOffsetTicks = 1;
+    std::chrono::seconds maxQuoteAge{5};
     std::size_t requiredConfirmations = 1;    // snapshot confirmations
     bool requireVolumeConfirmation = true;
     double minRelativeVolume = 1.2;
@@ -108,8 +120,11 @@ struct HandlingConfig {
     std::chrono::milliseconds pollInterval{1000};
     std::chrono::seconds entryFillTimeout{30};
     std::chrono::seconds exitFillTimeout{30};
+    std::chrono::seconds maxQuoteAge{5};
     std::size_t workerCount = 4;
+    double paperTradingCash = 100000.0;
     bool liveTrading = false;
+    bool allowShortSelling = false;           // final live/paper execution guard
 };
 
 /** Source of the tradable universe (e.g. NIFTY 100 constituents). */

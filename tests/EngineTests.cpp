@@ -4,11 +4,14 @@
 #include "zerotick/TradingDecisionEngine.h"
 #include "zerotick/TradeHandlingEngine.h"
 #include "zerotick/Risk.h"
+#include "zerotick/RuntimeConfig.h"
+#include "zerotick/Log.h"
 
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -84,7 +87,11 @@ class FakeKiteApi : public zerotick::KiteApi {
 public:
     explicit FakeKiteApi(const zerotick::MarketSnapshot& quote) : quote_(quote) {}
 
-    zerotick::MarketSnapshot getQuote(const std::string&) override { return quote_; }
+    zerotick::MarketSnapshot getQuote(
+        const std::string&,
+        std::chrono::seconds = std::chrono::seconds(5)) override {
+        return quote_;
+    }
     std::vector<zerotick::MarketSnapshot> refreshQuotes(
         const std::vector<std::string>&) override {
         return {};
@@ -93,11 +100,13 @@ public:
     zerotick::CashAvailability cashAvailability() override {
         return {100000.0, 0.0, 0.0, 100000.0, 0.0, 0.0, 100000.0};
     }
-    zerotick::OrderResult placeStopLimitEntry(const std::string&, int, double,
-                                              double) override {
+    zerotick::OrderResult placeStopLimitEntry(
+        const std::string&, int, double, double,
+        zerotick::PositionSide) override {
         return {true, "order", "submitted"};
     }
-    zerotick::OrderResult placeLimitExit(const std::string&, int, double) override {
+    zerotick::OrderResult placeLimitExit(
+        const std::string&, int, double, zerotick::PositionSide) override {
         return {true, "order", "submitted"};
     }
     zerotick::BrokerOrderStatus getOrderStatus(const std::string&) override {
@@ -127,6 +136,24 @@ void testNiftyUniverseUsesCurrentNifty100Symbols() {
     require(!universe.contains("GE"), "invalid GE symbol excluded");
     require(!universe.contains("ZOMATO"),
             "outdated ZOMATO symbol excluded");
+}
+
+void testLogLinePersistsToLogsFile() {
+    zerotick::initializeLogFile();
+    const std::string marker = "[test] persistent_log_marker";
+    zerotick::logLine(marker);
+
+    std::ifstream input("logs.txt");
+    require(static_cast<bool>(input), "logs.txt should be created");
+    bool markerFound = false;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.find(marker) != std::string::npos) {
+            markerFound = true;
+            break;
+        }
+    }
+    require(markerFound, "logLine should append timestamped file records");
 }
 
 void testRegistryOneEngineAtATime() {
@@ -227,6 +254,77 @@ void testSelectionSelectsGoodStock() {
         "an older quote must not roll the price baseline backward");
 
     engine.stop();
+}
+
+void testSelectionSelectsShortOnDownwardMomentumWhenEnabled() {
+    TestUniverse universe({"TEST"});
+    zerotick::StockEngineRegistry registry;
+    zerotick::ThreadSafeQueue<zerotick::MarketSnapshot> quoteUpdates;
+    zerotick::ThreadSafeQueue<zerotick::StockCandidate> output;
+    zerotick::SelectionConfig config;
+    config.workerCount = 1;
+    config.minPrice = 100.0;
+    config.minAbsoluteVolume = 1000;
+    config.minRelativeVolume = 0.0;
+    config.minPriceChangePercent = 0.05;
+    config.maxSpreadPercent = 1.0;
+    config.minDepthQuantity = 100;
+    config.minIntradayRangePercent = 0.0;
+    config.allowShortSelling = true;
+
+    zerotick::StockSelectionEngine engine(
+        quoteUpdates, registry, output, universe, config);
+    engine.start();
+
+    zerotick::MarketSnapshot baseline =
+        makeQuote(150.0, 200000, 5000, 1000, 149.0, 151.0, 148.0);
+    zerotick::MarketSnapshot falling =
+        makeQuote(149.85, 201000, 5000, 1000, 149.0, 151.0, 148.0);
+    falling.receivedAt =
+        baseline.receivedAt + std::chrono::milliseconds(1);
+    quoteUpdates.push(baseline);
+    quoteUpdates.push(falling);
+
+    zerotick::StockCandidate candidate;
+    require(output.pop(candidate, std::chrono::seconds(2)),
+            "selection should accept qualifying downward momentum");
+    require(candidate.side == zerotick::PositionSide::Short,
+            "negative momentum should select a short side");
+    engine.stop();
+}
+
+void testSelectionKeepsShortSellingDisabledByDefault() {
+    TestUniverse universe({"TEST"});
+    zerotick::StockEngineRegistry registry;
+    zerotick::ThreadSafeQueue<zerotick::MarketSnapshot> quoteUpdates;
+    zerotick::ThreadSafeQueue<zerotick::StockCandidate> output;
+    zerotick::SelectionConfig config;
+    config.workerCount = 1;
+    config.minPrice = 100.0;
+    config.minAbsoluteVolume = 1000;
+    config.minRelativeVolume = 0.0;
+    config.minPriceChangePercent = 0.05;
+    config.maxSpreadPercent = 1.0;
+    config.minDepthQuantity = 100;
+    config.minIntradayRangePercent = 0.0;
+
+    zerotick::StockSelectionEngine engine(
+        quoteUpdates, registry, output, universe, config);
+    engine.start();
+
+    zerotick::MarketSnapshot baseline =
+        makeQuote(150.0, 200000, 5000, 1000, 149.0, 151.0, 148.0);
+    zerotick::MarketSnapshot falling =
+        makeQuote(149.85, 201000, 5000, 1000, 149.0, 151.0, 148.0);
+    falling.receivedAt =
+        baseline.receivedAt + std::chrono::milliseconds(1);
+    quoteUpdates.push(baseline);
+    quoteUpdates.push(falling);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    engine.stop();
+
+    require(output.empty(),
+            "downward momentum must not create shorts without opt-in");
 }
 
 void testSelectionRejectsPriceChangeBelowMinimum() {
@@ -393,14 +491,66 @@ void testDecisionEmitsSignal() {
             "stop below entry limit");
     require(std::abs(
                 signal.targetPrice -
-                signal.entryLimitPrice * 1.004) < 1e-8,
-            "default target is 0.4 percent above entry limit");
+                signal.entryLimitPrice * 1.003) < 1e-8,
+            "default target is 0.3 percent above entry limit");
     require(std::abs(
                 signal.stopLossPrice -
-                signal.entryLimitPrice * 0.998) < 1e-8,
-            "default stop is 0.2 percent below entry limit");
+                signal.entryLimitPrice * 0.996) < 1e-8,
+            "default stop is 0.4 percent below entry limit");
     require(signal.quantity > 0, "signal quantity set");
 
+    engine.stop();
+}
+
+void testDecisionEmitsShortSignalWithDownwardOrderBookPressure() {
+    zerotick::MarketSnapshot quote =
+        makeQuote(150.0, 200000, 1000, 5000, 149.0, 151.0, 148.0);
+    FakeKiteApi api(quote);
+    zerotick::StockEngineRegistry registry;
+    require(registry.claim("TEST", zerotick::EngineId::Unassigned,
+                           zerotick::EngineId::Selection),
+            "pre-claim selection for short candidate");
+
+    zerotick::ThreadSafeQueue<zerotick::StockCandidate> input;
+    zerotick::ThreadSafeQueue<zerotick::TradeSignal> output;
+    zerotick::StockCandidate candidate;
+    candidate.symbol = "TEST";
+    candidate.side = zerotick::PositionSide::Short;
+    candidate.lastPrice = 150.0;
+    candidate.relativeVolume = 2.0;
+    input.push(candidate);
+
+    zerotick::DecisionConfig config;
+    config.allowShortSelling = true;
+    config.workerCount = 1;
+    config.pollInterval = std::chrono::milliseconds(10);
+    config.minimumImbalance = 0.0;
+    config.maximumSpreadPercent = 1.0;
+    config.requireVolumeConfirmation = false;
+
+    zerotick::TradingDecisionEngine engine(api, registry, input, output,
+                                           config);
+    engine.start();
+
+    zerotick::TradeSignal signal;
+    require(output.pop(signal, std::chrono::seconds(2)),
+            "decision should emit an enabled short signal");
+    require(signal.side == zerotick::PositionSide::Short,
+            "signal should retain short direction");
+    require(signal.entryTriggerPrice > signal.entryLimitPrice,
+            "sell stop-limit should place its limit below the trigger");
+    require(signal.targetPrice < signal.entryLimitPrice,
+            "short target should be below entry");
+    require(signal.stopLossPrice > signal.entryLimitPrice,
+            "short stop should be above entry");
+    require(std::abs(
+                signal.targetPrice -
+                signal.entryLimitPrice * 0.997) < 1e-8,
+            "short target should use the configured target percentage");
+    require(std::abs(
+                signal.stopLossPrice -
+                signal.entryLimitPrice * 1.004) < 1e-8,
+            "short stop should use the configured stop percentage");
     engine.stop();
 }
 
@@ -489,17 +639,148 @@ void testFreeCashSubtractsExistingUtilization() {
         "intraday payin should be included but capped at live balance");
 }
 
+void testRuntimeConfigLoadsAlgorithmParameters() {
+    const zerotick::RuntimeConfig config = zerotick::parseRuntimeConfig(
+        R"({"allow_short_selling":true,"market_data":{"quote_poll_interval_ms":750,"quote_max_age_seconds":8,"fallback_tick_size":0.05},"selection":{"min_price":125.0,"volume_ewma_alpha":0.3,"worker_count":2},"decision":{"target_percent":0.3,"stop_percent":0.4,"indicative_entry_budget":25000.0,"imbalance_level_weights":[1.0,0.7,0.5,0.3,0.1],"entry_trigger_offset_ticks":2,"entry_limit_offset_ticks":3},"risk":{"max_open_positions":5,"paper_trading_cash":50000.0},"backtest":{"initial_capital":20000.0,"max_open_positions":3,"entry_timeout_minutes":7,"entry_start_time":"12:00","entry_end_time":"13:00"}})");
+    require(config.allowShortSelling,
+            "configuration should allow explicitly enabled short selling");
+    require(config.selection.minPrice == 125.0 &&
+                config.selection.workerCount == 2 &&
+                config.selection.volumeEwmaAlpha == 0.3,
+            "selection parameters should load from configuration");
+    require(config.decision.targetPercent == 0.3 &&
+                config.decision.stopPercent == 0.4 &&
+                config.decision.indicativeEntryBudget == 25000.0 &&
+                config.decision.imbalanceLevelWeights[1] == 0.7 &&
+                config.decision.entryTriggerOffsetTicks == 2 &&
+                config.decision.entryLimitOffsetTicks == 3,
+            "decision and exit parameters should load from configuration");
+    require(config.maxOpenPositions == 5 &&
+                config.backtest.maxOpenPositions == 3,
+            "live and backtest position caps should be independently configured");
+    require(config.backtest.initialCapital == 20000.0 &&
+                config.backtest.entryStartTime == "12:00" &&
+                config.backtest.entryEndTime == "13:00" &&
+                config.backtest.entryTimeoutMinutes == 7 &&
+                config.backtest.fallbackTickSize == 0.05,
+            "backtest capital, window, tick, and entry timeout should load");
+    require(config.quotePollInterval.count() == 750 &&
+                config.selection.maxQuoteAge.count() == 8 &&
+                config.handling.maxQuoteAge.count() == 8 &&
+                config.paperTradingCash == 50000.0 &&
+                config.handling.paperTradingCash == 50000.0,
+            "market-data and paper-risk settings should reach runtime engines");
+    require(config.decision.fallbackTickSize == 0.05 &&
+                config.backtest.decision.entryTriggerOffsetTicks == 2,
+            "shared tick and entry settings should reach the relevant engines");
+    require(config.selection.allowShortSelling &&
+                config.decision.allowShortSelling,
+            "short-selling setting should reach the engine configs");
+}
+
+void testRuntimeConfigRejectsUnknownAndInvalidValues() {
+    bool unknownKeyRejected = false;
+    try {
+        zerotick::parseRuntimeConfig(R"({"decision":{"typo":1}})");
+    } catch (const std::invalid_argument&) {
+        unknownKeyRejected = true;
+    }
+    require(unknownKeyRejected,
+            "unknown configuration keys should be reported");
+
+    bool invalidWindowRejected = false;
+    try {
+        zerotick::parseRuntimeConfig(
+            R"({"backtest":{"entry_start_time":"13:00","entry_end_time":"12:00"}})");
+    } catch (const std::invalid_argument&) {
+        invalidWindowRejected = true;
+    }
+    require(invalidWindowRejected,
+            "invalid backtest entry windows should be rejected");
+
+    bool invalidTargetRejected = false;
+    try {
+        zerotick::parseRuntimeConfig(
+            R"({"decision":{"target_percent":0.0}})");
+    } catch (const std::invalid_argument&) {
+        invalidTargetRejected = true;
+    }
+    require(invalidTargetRejected,
+            "nonpositive exit targets should be rejected");
+
+    bool negativePositionLimitRejected = false;
+    try {
+        zerotick::parseRuntimeConfig(
+            R"({"risk":{"max_open_positions":-1}})");
+    } catch (const std::invalid_argument&) {
+        negativePositionLimitRejected = true;
+    }
+    require(negativePositionLimitRejected,
+            "negative position limits should be rejected");
+}
+
+void testCheckedInRuntimeConfigLoads() {
+    const zerotick::RuntimeConfig config =
+        zerotick::loadRuntimeConfig("config.json");
+    require(config.decision.targetPercent > 0.0 &&
+                config.decision.stopPercent > 0.0 &&
+                config.backtest.initialCapital > 0.0,
+            "checked-in algorithm settings should be valid and loaded");
+    require(config.backtest.maxOpenPositions > 0,
+            "checked-in backtest position cap should be loaded");
+    require(config.backtest.entryTimeoutMinutes == 5,
+            "checked-in backtest entry timeout should be five minutes");
+}
+
+void testBacktestPositionCapIsIndependentByDefault() {
+    const zerotick::RuntimeConfig config = zerotick::parseRuntimeConfig(
+        R"({"risk":{"max_open_positions":100},"backtest":{"initial_capital":10000.0}})");
+    require(config.maxOpenPositions == 100,
+            "live risk position cap should use risk.max_open_positions");
+    require(config.backtest.maxOpenPositions == 10,
+            "backtest should retain its independent default position cap");
+}
+
+void testBacktestReportsInsufficientPerPositionBudget() {
+    TestUniverse universe({"TEST"});
+    std::map<std::string, std::vector<zerotick::HistoricalCandle>> data;
+    data["TEST"] = {
+        makeCandle("2026-11-18T12:00:00+0530",
+                   150.0, 151.0, 149.0, 150.0, 100000),
+        makeCandle("2026-11-18T12:01:00+0530",
+                   150.0, 151.2, 149.9, 150.15, 1000)
+    };
+
+    zerotick::BacktestConfig config;
+    config.initialCapital = 10000.0;
+    config.maxOpenPositions = 100;
+    config.selection.minAbsoluteVolume = 1;
+    config.selection.minRelativeVolume = 0.0;
+    config.selection.minIntradayRangePercent = 0.3;
+    config.decision.requireVolumeConfirmation = false;
+
+    zerotick::BacktestEngine engine;
+    const zerotick::BacktestResult result =
+        engine.run(universe, data, {{"TEST", 0.01}}, config);
+    require(result.generatedSignals == 1,
+            "a qualified signal should be counted before risk sizing");
+    require(result.riskRejectedSignals == 1 &&
+                result.insufficientBudgetRejectedSignals == 1 &&
+                result.positionLimitRejectedSignals == 0,
+            "budget rejection should be distinguished from the position cap");
+}
+
 void testBacktestUsesNextCandleEntryAndTargetExit() {
     TestUniverse universe({"TEST"});
     std::map<std::string, std::vector<zerotick::HistoricalCandle>> data;
     data["TEST"] = {
-        makeCandle("2026-11-18T09:15:00+0530",
+        makeCandle("2026-11-18T12:00:00+0530",
                    150.0, 151.0, 149.0, 150.0, 100000),
-        makeCandle("2026-11-18T09:16:00+0530",
+        makeCandle("2026-11-18T12:01:00+0530",
                    150.0, 151.2, 149.9, 150.15, 1000),
-        makeCandle("2026-11-18T09:17:00+0530",
+        makeCandle("2026-11-18T12:02:00+0530",
                    150.15, 150.18, 150.14, 150.16, 1000),
-        makeCandle("2026-11-18T09:18:00+0530",
+        makeCandle("2026-11-18T12:03:00+0530",
                    150.2, 151.0, 150.0, 150.6, 1000)
     };
     std::map<std::string, double> tickSizes;
@@ -519,7 +800,7 @@ void testBacktestUsesNextCandleEntryAndTargetExit() {
     require(result.generatedSignals == 1, "one candle signal should qualify");
     require(result.filledEntries == 1, "next candle should fill the entry");
     require(result.trades.size() == 1, "one trade should close");
-    require(result.trades[0].entryTime == "2026-11-18T09:17:00+0530",
+    require(result.trades[0].entryTime == "2026-11-18T12:02:00+0530",
             "entry must not fill on the signal candle");
     require(result.trades[0].exitReason == "target",
             "a later candle reaching target should exit the trade");
@@ -533,17 +814,94 @@ void testBacktestUsesNextCandleEntryAndTargetExit() {
             "ending capital should reconcile to gross P&L");
 }
 
+void testBacktestKeepsEntryPendingForFiveMinutes() {
+    TestUniverse universe({"TEST"});
+    std::map<std::string, std::vector<zerotick::HistoricalCandle>> data;
+    data["TEST"] = {
+        makeCandle("2026-11-18T12:00:00+0530",
+                   150.0, 151.0, 149.0, 150.0, 100000),
+        makeCandle("2026-11-18T12:01:00+0530",
+                   150.0, 151.2, 149.9, 150.15, 1000),
+        makeCandle("2026-11-18T12:02:00+0530",
+                   150.15, 150.15, 150.10, 150.14, 1000),
+        makeCandle("2026-11-18T12:03:00+0530",
+                   150.14, 150.15, 150.10, 150.13, 1000),
+        makeCandle("2026-11-18T12:04:00+0530",
+                   150.13, 150.15, 150.10, 150.12, 1000),
+        makeCandle("2026-11-18T12:05:00+0530",
+                   150.12, 150.15, 150.10, 150.11, 1000),
+        makeCandle("2026-11-18T12:06:00+0530",
+                   150.11, 150.25, 150.10, 150.20, 1000),
+        makeCandle("2026-11-18T12:07:00+0530",
+                   150.20, 151.0, 150.15, 150.8, 1000)
+    };
+
+    zerotick::BacktestConfig config;
+    config.entryTimeoutMinutes = 5;
+    config.selection.minAbsoluteVolume = 1;
+    config.selection.minRelativeVolume = 0.0;
+    config.selection.minIntradayRangePercent = 0.3;
+    config.decision.requireVolumeConfirmation = false;
+
+    zerotick::BacktestEngine engine;
+    const zerotick::BacktestResult result =
+        engine.run(universe, data, {{"TEST", 0.01}}, config);
+    require(result.generatedSignals == 1,
+            "the initial qualifying bar should create one signal");
+    require(result.filledEntries == 1 && result.trades.size() == 1,
+            "entry should fill when triggered within the five-minute window");
+    require(result.trades[0].entryTime ==
+                "2026-11-18T12:06:00+0530",
+            "entry should remain eligible through the fifth subsequent minute");
+}
+
+void testBacktestExpiresEntryAfterFiveMinutes() {
+    TestUniverse universe({"TEST"});
+    std::map<std::string, std::vector<zerotick::HistoricalCandle>> data;
+    data["TEST"] = {
+        makeCandle("2026-11-18T12:00:00+0530",
+                   150.0, 151.0, 149.0, 150.0, 100000),
+        makeCandle("2026-11-18T12:01:00+0530",
+                   150.0, 151.2, 149.9, 150.15, 1000),
+        makeCandle("2026-11-18T12:02:00+0530",
+                   150.15, 150.15, 150.10, 150.14, 1000),
+        makeCandle("2026-11-18T12:03:00+0530",
+                   150.14, 150.15, 150.10, 150.13, 1000),
+        makeCandle("2026-11-18T12:04:00+0530",
+                   150.13, 150.15, 150.10, 150.12, 1000),
+        makeCandle("2026-11-18T12:05:00+0530",
+                   150.12, 150.15, 150.10, 150.11, 1000),
+        makeCandle("2026-11-18T12:06:00+0530",
+                   150.11, 150.15, 150.10, 150.12, 1000)
+    };
+
+    zerotick::BacktestConfig config;
+    config.entryTimeoutMinutes = 5;
+    config.selection.minAbsoluteVolume = 1;
+    config.selection.minRelativeVolume = 0.0;
+    config.selection.minIntradayRangePercent = 0.3;
+    config.decision.requireVolumeConfirmation = false;
+
+    zerotick::BacktestEngine engine;
+    const zerotick::BacktestResult result =
+        engine.run(universe, data, {{"TEST", 0.01}}, config);
+    require(result.generatedSignals == 1,
+            "the initial qualifying bar should create one signal");
+    require(result.filledEntries == 0 && result.unfilledEntries == 1,
+            "entry should expire when no trigger occurs within five minutes");
+}
+
 void testBacktestUsesStopFirstWhenCandleTouchesBothLevels() {
     TestUniverse universe({"TEST"});
     std::map<std::string, std::vector<zerotick::HistoricalCandle>> data;
     data["TEST"] = {
-        makeCandle("2026-11-18T09:15:00+0530",
+        makeCandle("2026-11-18T12:00:00+0530",
                    150.0, 151.0, 149.0, 150.0, 100000),
-        makeCandle("2026-11-18T09:16:00+0530",
+        makeCandle("2026-11-18T12:01:00+0530",
                    150.0, 151.2, 149.9, 150.15, 1000),
-        makeCandle("2026-11-18T09:17:00+0530",
+        makeCandle("2026-11-18T12:02:00+0530",
                    150.15, 150.18, 150.14, 150.16, 1000),
-        makeCandle("2026-11-18T09:18:00+0530",
+        makeCandle("2026-11-18T12:03:00+0530",
                    150.16, 151.0, 149.0, 150.0, 1000)
     };
     std::map<std::string, double> tickSizes;
@@ -563,6 +921,137 @@ void testBacktestUsesStopFirstWhenCandleTouchesBothLevels() {
             "ambiguous bars should assume the stop was hit first");
     require(result.trades[0].grossProfitLoss < 0.0,
             "stop-first handling should record a conservative loss");
+}
+
+void testBacktestIgnoresSignalsBeforeEntryWindow() {
+    TestUniverse universe({"TEST"});
+    std::map<std::string, std::vector<zerotick::HistoricalCandle>> data;
+    data["TEST"] = {
+        makeCandle("2026-11-18T11:58:00+0530",
+                   150.0, 151.0, 149.0, 150.0, 100000),
+        makeCandle("2026-11-18T11:59:00+0530",
+                   150.0, 150.2, 149.9, 150.15, 1000)
+    };
+
+    zerotick::BacktestConfig config;
+    config.selection.minAbsoluteVolume = 1;
+    config.selection.minRelativeVolume = 0.0;
+    config.selection.minIntradayRangePercent = 0.3;
+    config.decision.requireVolumeConfirmation = false;
+
+    zerotick::BacktestEngine engine;
+    const zerotick::BacktestResult result =
+        engine.run(universe, data, {{"TEST", 0.01}}, config);
+    require(result.generatedSignals == 0,
+            "signals before noon must be excluded from the backtest");
+    require(result.trades.empty(),
+            "no position should open before the entry window");
+}
+
+void testBacktestCancelsEntriesAtOrAfterWindowEnd() {
+    TestUniverse universe({"TEST"});
+    std::map<std::string, std::vector<zerotick::HistoricalCandle>> data;
+    data["TEST"] = {
+        makeCandle("2026-11-18T12:58:00+0530",
+                   150.0, 151.0, 149.0, 150.0, 100000),
+        makeCandle("2026-11-18T12:59:00+0530",
+                   150.0, 150.2, 149.9, 150.15, 1000),
+        makeCandle("2026-11-18T13:00:00+0530",
+                   150.15, 150.3, 150.1, 150.16, 1000)
+    };
+
+    zerotick::BacktestConfig config;
+    config.selection.minAbsoluteVolume = 1;
+    config.selection.minRelativeVolume = 0.0;
+    config.selection.minIntradayRangePercent = 0.3;
+    config.decision.requireVolumeConfirmation = false;
+
+    zerotick::BacktestEngine engine;
+    const zerotick::BacktestResult result =
+        engine.run(universe, data, {{"TEST", 0.01}}, config);
+    require(result.generatedSignals == 1,
+            "a signal may be generated for an entry before the window ends");
+    require(result.filledEntries == 0 && result.trades.empty(),
+            "an entry at 13:00 must not fill outside the noon window");
+    require(result.unfilledEntries == 1,
+            "the out-of-window pending entry should be counted as unfilled");
+}
+
+void testBacktestShortEntryAndTargetExit() {
+    TestUniverse universe({"TEST"});
+    std::map<std::string, std::vector<zerotick::HistoricalCandle>> data;
+    data["TEST"] = {
+        makeCandle("2026-11-18T12:00:00+0530",
+                   150.0, 151.0, 149.0, 150.0, 100000),
+        makeCandle("2026-11-18T12:01:00+0530",
+                   150.0, 150.05, 149.8, 149.85, 1000),
+        makeCandle("2026-11-18T12:02:00+0530",
+                   149.85, 149.9, 149.7, 149.75, 1000),
+        makeCandle("2026-11-18T12:03:00+0530",
+                   149.75, 149.8, 149.0, 149.1, 1000)
+    };
+
+    zerotick::BacktestConfig config;
+    config.selection.minPrice = 100.0;
+    config.selection.minAbsoluteVolume = 1;
+    config.selection.minRelativeVolume = 0.0;
+    config.selection.minIntradayRangePercent = 0.3;
+    config.selection.allowShortSelling = true;
+    config.decision.allowShortSelling = true;
+    config.decision.requireVolumeConfirmation = false;
+
+    zerotick::BacktestEngine engine;
+    const zerotick::BacktestResult result =
+        engine.run(universe, data, {{"TEST", 0.01}}, config);
+    require(result.generatedSignals == 1,
+            "downward momentum should generate one short signal");
+    require(result.filledEntries == 1,
+            "next candle should fill the short stop-limit entry");
+    require(result.trades.size() == 1,
+            "short target should close the position");
+    require(result.trades[0].side == zerotick::PositionSide::Short,
+            "backtest trade should retain short direction");
+    require(result.trades[0].exitReason == "target",
+            "downward target should close the short");
+    require(result.trades[0].grossProfitLoss > 0.0,
+            "a short target exit should produce positive P&L");
+    require(std::abs(
+                result.endingCapital -
+                (result.initialCapital + result.grossProfitLoss)) < 0.0001,
+            "short proceeds and cover cost should reconcile to P&L");
+}
+
+void testBacktestShortStopWinsWhenBothLevelsAreTouched() {
+    TestUniverse universe({"TEST"});
+    std::map<std::string, std::vector<zerotick::HistoricalCandle>> data;
+    data["TEST"] = {
+        makeCandle("2026-11-18T12:00:00+0530",
+                   150.0, 151.0, 149.0, 150.0, 100000),
+        makeCandle("2026-11-18T12:01:00+0530",
+                   150.0, 150.05, 149.8, 149.85, 1000),
+        makeCandle("2026-11-18T12:02:00+0530",
+                   149.85, 149.9, 149.7, 149.75, 1000),
+        makeCandle("2026-11-18T12:03:00+0530",
+                   150.5, 150.6, 149.0, 150.0, 1000)
+    };
+
+    zerotick::BacktestConfig config;
+    config.selection.minAbsoluteVolume = 1;
+    config.selection.minRelativeVolume = 0.0;
+    config.selection.minIntradayRangePercent = 0.3;
+    config.selection.allowShortSelling = true;
+    config.decision.allowShortSelling = true;
+    config.decision.requireVolumeConfirmation = false;
+
+    zerotick::BacktestEngine engine;
+    const zerotick::BacktestResult result =
+        engine.run(universe, data, {{"TEST", 0.01}}, config);
+    require(result.trades.size() == 1,
+            "short position should close after crossing its stop");
+    require(result.trades[0].exitReason == "stop_loss",
+            "short stop should win when both levels are touched");
+    require(result.trades[0].grossProfitLoss < 0.0,
+            "short stop should record a loss");
 }
 
 void testFullPipelinePaperMode() {
@@ -593,7 +1082,6 @@ void testFullPipelinePaperMode() {
 
     zerotick::DecisionConfig decisionConfig;
     decisionConfig.workerCount = 1;
-    decisionConfig.pollInterval = std::chrono::milliseconds(10);
     decisionConfig.minimumImbalance = 0.0;
     decisionConfig.maximumSpreadPercent = 1.0;
     decisionConfig.requireVolumeConfirmation = false;
@@ -633,20 +1121,35 @@ void testFullPipelinePaperMode() {
 
 int main() {
     try {
+        testLogLinePersistsToLogsFile();
         testNiftyUniverseUsesCurrentNifty100Symbols();
         testRegistryOneEngineAtATime();
         testSelectionSelectsGoodStock();
+        testSelectionSelectsShortOnDownwardMomentumWhenEnabled();
+        testSelectionKeepsShortSellingDisabledByDefault();
         testSelectionRejectsPriceChangeBelowMinimum();
         testSelectionRejectsLowPrice();
         testSelectionRejectsLowVolume();
         testSelectionWaitsUntilQuoteAvailable();
         testDecisionEmitsSignal();
+        testDecisionEmitsShortSignalWithDownwardOrderBookPressure();
         testHandlingPaperModeRoundTrip();
         testQuantityUsesFullEqualSlotBudget();
         testPortfolioRiskManagerLimitsAndDividesSlotsEqually();
         testFreeCashSubtractsExistingUtilization();
+        testRuntimeConfigLoadsAlgorithmParameters();
+        testRuntimeConfigRejectsUnknownAndInvalidValues();
+        testCheckedInRuntimeConfigLoads();
+        testBacktestPositionCapIsIndependentByDefault();
+        testBacktestReportsInsufficientPerPositionBudget();
         testBacktestUsesNextCandleEntryAndTargetExit();
+        testBacktestKeepsEntryPendingForFiveMinutes();
+        testBacktestExpiresEntryAfterFiveMinutes();
         testBacktestUsesStopFirstWhenCandleTouchesBothLevels();
+        testBacktestIgnoresSignalsBeforeEntryWindow();
+        testBacktestCancelsEntriesAtOrAfterWindowEnd();
+        testBacktestShortEntryAndTargetExit();
+        testBacktestShortStopWinsWhenBothLevelsAreTouched();
         testFullPipelinePaperMode();
     } catch (const std::exception& exception) {
         std::cerr << "Engine test failed: " << exception.what() << '\n';

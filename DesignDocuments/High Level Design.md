@@ -44,6 +44,15 @@ for the local authentication callback, CNG for the login checksum, and
 `nlohmann/json` for JSON parsing. Credentials are loaded locally; they must
 not be committed or printed in logs.
 
+Algorithm settings are loaded at startup from `config.json` in the working
+directory, or from the file supplied with `--config <path>`. The file controls
+selection and decision thresholds, volume smoothing and book-imbalance
+weights, quote freshness, tick offsets, target/stop percentages, worker and
+polling settings, position and paper-cash limits, short-selling opt-in, and
+backtest capital and entry window. Invalid or unknown settings stop startup
+with an error. Editing the file takes effect on the next executable start;
+live order submission still separately requires `--enable-live-trading`.
+
 ## 3. Runtime architecture
 
 ```mermaid
@@ -143,10 +152,11 @@ the same time.
 
 ## 6. Selection and decision algorithms
 
-The selection and decision stages are long-only gates: selection narrows fresh
-market snapshots to candidates, then decision rechecks each candidate before
-creating a buy signal. Neither stage submits orders; execution and risk checks
-remain in `TradeHandlingEngine`.
+Selection narrows fresh market snapshots to directional candidates, then
+decision rechecks each candidate before creating a long or short signal.
+Short selling is disabled unless opted in through `allow_short_selling` in the
+runtime config or `--enable-shorts`. Neither stage submits orders; execution
+and risk checks remain in `TradeHandlingEngine`.
 
 ### Stock selection
 
@@ -161,12 +171,12 @@ filters in order:
 | Relative volume | At least 1.5 |
 | Best bid/ask spread | No more than 0.20% |
 | Displayed bid and ask depth | At least 1,000 on each side |
-| Change from previous newer quote | At least +0.05% |
+| Directional change from previous newer quote | At least 0.05% in the selected direction |
 | Intraday high/low range | 0.30% to 6.0% |
 | Absolute change from previous quote | No more than 6.0% |
 
 The volume baseline is an EWMA of cumulative quote-volume samples with
-`alpha = 0.2`:
+configurable `alpha` (default `0.2`):
 
 ```text
 average_t      = 0.2 * volume_t + 0.8 * average_(t-1)
@@ -187,10 +197,12 @@ rangePercent       = (high - low) / low * 100
 spreadPercent      = (ask - bid) / ((ask + bid) / 2) * 100
 ```
 
-The first valid quote seeds the price baseline and cannot pass the +0.05%
+The first valid quote seeds the price baseline and cannot pass the 0.05%
 movement gate by itself. A newer quote advances the baseline even when another
 selection filter rejects it; an out-of-order quote cannot move that baseline
 backward. A candidate is sent to decision only after all selection gates pass.
+Upward momentum produces a long candidate. Downward momentum produces a short
+candidate only when short selling is explicitly enabled.
 
 ### Trade decision
 
@@ -200,10 +212,13 @@ and requires:
 - Fresh spread no greater than **0.10%**.
 - Candidate relative volume of at least **1.2** when volume confirmation is
   enabled (enabled by default).
-- Weighted bid-side imbalance of at least **+0.05**.
-- Fresh last price not below the candidate's selected price.
+- Long: weighted bid-side imbalance at least **+0.05** and fresh price not
+  below the selected price.
+- Short (explicit opt-in): weighted imbalance at most **-0.05** and fresh
+  price not above the selected price.
 
-The five-level imbalance weights nearer levels more heavily:
+The five-level imbalance weights nearer levels more heavily; each weight is
+configurable:
 
 ```text
 imbalance = (sum(weight_i * bidQty_i) - sum(weight_i * askQty_i))
@@ -211,13 +226,14 @@ imbalance = (sum(weight_i * bidQty_i) - sum(weight_i * askQty_i))
 weights   = [1.0, 0.8, 0.6, 0.4, 0.2]
 ```
 
-If these checks pass, decision creates a long `TradeSignal`; it does not place
-an order. Tick size is inferred from adjacent depth prices, with `0.01` as a
-fallback. The entry trigger is one tick above the rounded-up greater of last
-price and best ask; the limit is one more tick above the trigger. Defaults set
-the target to **+0.40%** and the stop to **-0.20%** from the entry limit.
-Decision attaches an indicative quantity based on a fixed 50,000 budget;
-handling recalculates quantity against the portfolio slot and may reject it.
+If these checks pass, decision creates a directional `TradeSignal`; it does
+not place an order. Tick size is inferred from adjacent depth prices, with a
+configurable `0.01` fallback. Entry trigger and limit offsets are configurable
+in ticks. Long entries trigger above the ask and target higher;
+short entries trigger below the bid and target lower. The target is 0.30% and
+the stop is 0.40%, mirrored around entry. Decision attaches an indicative
+quantity based on a configurable 50,000 budget; handling recalculates quantity
+against the portfolio slot and may reject it.
 
 The current decision stage evaluates one fresh quote per candidate; it does
 not wait for multiple-snapshot confirmation.
@@ -231,14 +247,25 @@ instrument dump supplies instrument tokens and tick sizes. Trade details are
 printed as an aligned console table, followed by a summary whose final line is
 the total profit or loss.
 
+Historical replays, including `--optimize-100-days`, only open new positions
+from **12:00 to 13:00 NSE time**. This time-of-day proxy avoids the opening
+period; it is not a measured volatility threshold. Positions already opened
+remain subject to target/stop monitoring and end-of-day closure outside this
+window. This filter does not affect live trading.
+
 This is not a full-depth replay: candles contain no historical spread, depth,
 or five-level imbalance, so those gates are omitted. Signals are evaluated at
-bar close, entries are tested against the next one-minute bar, ambiguous
+bar close, and pending entries are checked against following one-minute bars
+for up to the configured entry timeout (five minutes by default). Ambiguous
 stop/target bars assume stop-first, and remaining positions close at the end
-of the day. The next-bar entry window differs from the live 30-second timeout.
+of the day. The backtest entry timeout differs from the live 30-second timeout.
 Fees and slippage are excluded. The backtest uses the current NIFTY 100 list
 for earlier dates and may therefore have survivorship bias. Backtest mode
 cannot submit live orders.
+`--enable-shorts` includes short signals in backtests and optimization runs;
+in live mode it is an additional explicit opt-in required alongside
+`--enable-live-trading`. Short MIS trades sell to enter and buy to cover. The
+share-count sizing cap does not model broker-specific short margin requirements.
 
 `--optimize-100-days` fetches the latest 100 completed sessions in weekly
 chunks and evaluates 20 predefined selection/exit combinations. The first 70
@@ -251,7 +278,8 @@ This is a bounded diagnostic sweep, not a guarantee of profitability.
   `TradeHandlingEngine`.
 - **Live mode:** `--enable-live-trading` enables real Kite MIS order submission.
   Startup checks for existing MIS positions and open orders, reads available
-  cash, and applies an in-memory maximum of ten reserved position slots.
+  cash, and applies the configured maximum reserved position slots (10 by
+  default).
 - The application monitors target and stop conditions in-process. These are
   not broker-hosted OCO/bracket protections; a crash, network issue, or
   shutdown can leave broker state requiring manual review.

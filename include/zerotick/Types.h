@@ -7,6 +7,11 @@
 
 namespace zerotick {
 
+enum class PositionSide {
+    Long,
+    Short
+};
+
 struct OrderBookLevel {
     double price = 0.0;
     std::uint64_t quantity = 0;

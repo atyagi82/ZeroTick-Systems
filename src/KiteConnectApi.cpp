@@ -332,14 +332,16 @@ std::string requestTokenFromBrowser(const std::string& apiKey) {
     const std::string loginUrl =
         "https://kite.zerodha.com/connect/login?v=3&api_key=" +
         urlEncode(apiKey);
-    std::cout << "Starting Kite login in your browser...\n";
+    zerotick::logLine("[kite_auth] browser_login_started");
     const HINSTANCE browserResult = ShellExecuteA(
         nullptr, "open", loginUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     if (reinterpret_cast<INT_PTR>(browserResult) <= 32) {
+        zerotick::logLine(
+            "[kite_auth] browser_launch_failed; login_url_printed_to_console");
         std::cout << "Could not open a browser automatically. Open this URL:\n"
                   << loginUrl << '\n';
     }
-    std::cout << "Waiting for the Kite login callback on localhost...\n";
+    zerotick::logLine("[kite_auth] waiting_for_local_callback");
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::minutes(5);
@@ -403,6 +405,7 @@ std::string requestTokenFromBrowser(const std::string& apiKey) {
             sendCallbackResponse(
                 client.get(), "200 OK",
                 "Kite login was not completed. You may close this page.");
+            zerotick::logLine("[kite_auth] callback_returned_error");
             throw std::runtime_error("Kite login was not completed");
         }
 
@@ -418,10 +421,11 @@ std::string requestTokenFromBrowser(const std::string& apiKey) {
         sendCallbackResponse(
             client.get(), "200 OK",
             "Kite login received. You may close this page.");
-        std::cout << "Kite login callback received; exchanging token.\n";
+        zerotick::logLine("[kite_auth] callback_received");
         return token->second;
     }
 
+    zerotick::logLine("[kite_auth] callback_timeout");
     throw std::runtime_error("Timed out waiting for Kite login callback");
 }
 
@@ -522,6 +526,19 @@ std::string httpRequest(
     const std::string& apiKey,
     const std::string& accessToken,
     bool jsonBody = false) {
+    const auto requestStartedAt = std::chrono::steady_clock::now();
+    const std::wstring wideMethod(method);
+    std::string requestMethod;
+    requestMethod.reserve(wideMethod.size());
+    for (wchar_t character : wideMethod) {
+        requestMethod.push_back(static_cast<char>(character));
+    }
+    zerotick::logLine(
+        "[kite_api] request_start operation=" + std::string(operation) +
+        " method=" + requestMethod);
+    DWORD statusCode = 0;
+    std::size_t responseBytes = 0;
+    try {
     WinHttpHandle session(WinHttpOpen(
         L"ZeroTick-Systems/0.1",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -587,7 +604,6 @@ std::string httpRequest(
         throw std::runtime_error("Kite HTTP request failed");
     }
 
-    DWORD statusCode = 0;
     DWORD statusSize = sizeof(statusCode);
     if (!WinHttpQueryHeaders(
             request.get(),
@@ -617,6 +633,7 @@ std::string httpRequest(
         }
         response.append(buffer.data(), received);
     }
+    responseBytes = response.size();
 
     // Avoid echoing response bodies that may contain account/session details.
     if (statusCode < 200 || statusCode >= 300) {
@@ -635,7 +652,38 @@ std::string httpRequest(
         }
         throw KiteHttpError(statusCode, message.str());
     }
+    const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - requestStartedAt).count();
+    zerotick::logLine(
+        "[kite_api] request_complete operation=" + std::string(operation) +
+        " method=" + requestMethod +
+        " status=" + std::to_string(statusCode) +
+        " response_bytes=" + std::to_string(responseBytes) +
+        " duration_ms=" + std::to_string(duration));
     return response;
+    } catch (const KiteHttpError& exception) {
+        const auto duration =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - requestStartedAt).count();
+        zerotick::logLine(
+            "[kite_api] request_failed operation=" + std::string(operation) +
+            " method=" + requestMethod +
+            " status=" + std::to_string(exception.statusCode()) +
+            " response_bytes=" + std::to_string(responseBytes) +
+            " duration_ms=" + std::to_string(duration));
+        throw;
+    } catch (const std::exception&) {
+        const auto duration =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - requestStartedAt).count();
+        zerotick::logLine(
+            "[kite_api] request_failed operation=" + std::string(operation) +
+            " method=" + requestMethod +
+            " status=" + std::to_string(statusCode) +
+            " response_bytes=" + std::to_string(responseBytes) +
+            " duration_ms=" + std::to_string(duration));
+        throw;
+    }
 }
 
 void persistAccessToken(const std::string& accessToken) {
@@ -772,7 +820,7 @@ KiteConnectApi::KiteConnectApi(bool forceLogin) {
             throw std::runtime_error("Kite returned an empty access token");
         }
         persistAccessToken(accessToken_);
-        std::cout << "Kite access token obtained and saved in local .env\n";
+        zerotick::logLine("[kite_auth] access_token_saved_to_local_env");
     }
 
     healthy_ = true;
@@ -884,6 +932,10 @@ void KiteConnectApi::ensureInstrumentListLoaded() const {
 
     nseInstruments_.swap(loaded);
     instrumentListLoaded_ = true;
+    logLine("[kite_api] instruments_loaded count=" +
+            std::to_string(nseInstruments_.size()) +
+            " invalid_rows_skipped=" +
+            std::to_string(invalidMetadataRows));
 }
 
 double KiteConnectApi::getInstrumentTickSize(
@@ -928,6 +980,8 @@ std::vector<HistoricalCandle> KiteConnectApi::getHistoricalCandles(
 
     const std::string from = fromDate + " 09:15:00";
     const std::string to = toDate + " 15:30:00";
+    logLine("[kite_api] historical_request symbol=" + symbol +
+            " from=" + fromDate + " to=" + toDate);
     const std::string requestPath =
         "/instruments/historical/" + token + "/minute?from=" +
         urlEncode(from) + "&to=" + urlEncode(to) + "&oi=0";
@@ -981,20 +1035,26 @@ std::vector<HistoricalCandle> KiteConnectApi::getHistoricalCandles(
         previousTimestamp = candle.timestamp;
         candles.push_back(std::move(candle));
     }
+    logLine("[kite_api] historical_result symbol=" + symbol +
+            " from=" + fromDate + " to=" + toDate +
+            " candles=" + std::to_string(candles.size()));
     return candles;
 }
 
-MarketSnapshot KiteConnectApi::getQuote(const std::string& symbol) {
+MarketSnapshot KiteConnectApi::getQuote(
+    const std::string& symbol, std::chrono::seconds maxAge) {
     std::lock_guard<std::mutex> lock(quoteMutex_);
     const auto found = quotes_.find(symbol);
     if (found == quotes_.end()) {
+        zerotick::logLine("[kite_api] quote_cache_miss symbol=" + symbol);
         throw std::runtime_error(
             "No Kite quote cached yet for " + symbol);
     }
-    if (std::chrono::steady_clock::now() - found->second.receivedAt >
-        std::chrono::seconds(5)) {
+    if (std::chrono::steady_clock::now() - found->second.receivedAt > maxAge) {
+        zerotick::logLine("[kite_api] quote_cache_stale symbol=" + symbol);
         throw std::runtime_error("Kite quote is stale for " + symbol);
     }
+    zerotick::logLine("[kite_api] quote_cache_hit symbol=" + symbol);
     return found->second;
 }
 
@@ -1027,6 +1087,7 @@ std::vector<MarketSnapshot> KiteConnectApi::refreshQuotes(
     std::map<std::string, MarketSnapshot> updated;
     std::vector<MarketSnapshot> refreshed;
     refreshed.reserve(symbols.size());
+    std::size_t missing = 0;
     {
         // Seed with the current cache so chunked refreshes accumulate rather
         // than replace previously cached instruments.
@@ -1049,6 +1110,7 @@ std::vector<MarketSnapshot> KiteConnectApi::refreshQuotes(
             if (firstMissing) {
                 zerotick::logLine("[kite] quote_missing symbol=" + symbol);
             }
+            ++missing;
             continue;
         }
         MarketSnapshot snapshot = parseQuote(*it, symbol);
@@ -1067,6 +1129,11 @@ std::vector<MarketSnapshot> KiteConnectApi::refreshQuotes(
     // Merge into the cache in one operation so readers never mix two batches.
     std::lock_guard<std::mutex> lock(quoteMutex_);
     quotes_.swap(updated);
+    zerotick::logLine(
+        "[kite_api] quote_refresh_complete requested=" +
+        std::to_string(symbols.size()) +
+        " returned=" + std::to_string(refreshed.size()) +
+        " missing=" + std::to_string(missing));
     return refreshed;
 }
 
@@ -1077,6 +1144,8 @@ void KiteConnectApi::ensureNoOpenMisExposure(
             "MIS exposure preflight needs at least one symbol");
     }
 
+    logLine("[kite_api] live_preflight_started symbols=" +
+            std::to_string(symbols.size()));
     const std::string positionsResponse = httpRequest(
         "Kite positions preflight",
         L"GET", L"/portfolio/positions", std::string(),
@@ -1124,6 +1193,7 @@ void KiteConnectApi::ensureNoOpenMisExposure(
                 symbol);
         }
     }
+    logLine("[kite_api] live_preflight_completed");
 }
 
 CashAvailability KiteConnectApi::cashAvailability() {
@@ -1149,6 +1219,7 @@ CashAvailability KiteConnectApi::cashAvailability() {
         available.at("collateral").get<double>();
     const double utilized =
         equity.at("utilised").at("debits").get<double>();
+    zerotick::logLine("[kite_api] cash_availability_loaded");
     return {
         cash,
         intradayPayin,
@@ -1164,13 +1235,20 @@ OrderResult KiteConnectApi::placeStopLimitEntry(
     const std::string& symbol,
     int quantity,
     double triggerPrice,
-    double limitPrice) {
-    if (quantity <= 0 || triggerPrice <= 0.0 || limitPrice < triggerPrice) {
+    double limitPrice,
+    PositionSide side) {
+    const bool invalidLimit = side == PositionSide::Long
+        ? limitPrice < triggerPrice
+        : limitPrice > triggerPrice;
+    if (quantity <= 0 || triggerPrice <= 0.0 || limitPrice <= 0.0 ||
+        invalidLimit) {
         throw std::invalid_argument("Invalid stop-limit entry parameters");
     }
     const std::string body =
         "tradingsymbol=" + urlEncode(symbol) +
-        "&exchange=NSE&transaction_type=BUY&order_type=SL" +
+        "&exchange=NSE&transaction_type=" +
+        (side == PositionSide::Long ? "BUY" : "SELL") +
+        "&order_type=SL" +
         "&quantity=" + std::to_string(quantity) +
         "&product=MIS&validity=DAY&trigger_price=" +
         orderPrice(triggerPrice) + "&price=" + orderPrice(limitPrice);
@@ -1181,6 +1259,10 @@ OrderResult KiteConnectApi::placeStopLimitEntry(
     if (result.value("status", std::string()) != "success") {
         throw std::runtime_error("Kite did not accept the entry order");
     }
+    logLine("[kite_api] entry_order_accepted symbol=" + symbol +
+            " side=" +
+            (side == PositionSide::Long ? "LONG" : "SHORT") +
+            " quantity=" + std::to_string(quantity));
     return {
         true,
         result.at("data").at("order_id").get<std::string>(),
@@ -1191,13 +1273,16 @@ OrderResult KiteConnectApi::placeStopLimitEntry(
 OrderResult KiteConnectApi::placeLimitExit(
     const std::string& symbol,
     int quantity,
-    double limitPrice) {
+    double limitPrice,
+    PositionSide positionSide) {
     if (quantity <= 0 || limitPrice <= 0.0) {
         throw std::invalid_argument("Invalid limit-exit parameters");
     }
     const std::string body =
         "tradingsymbol=" + urlEncode(symbol) +
-        "&exchange=NSE&transaction_type=SELL&order_type=LIMIT" +
+        "&exchange=NSE&transaction_type=" +
+        (positionSide == PositionSide::Long ? "SELL" : "BUY") +
+        "&order_type=LIMIT" +
         "&quantity=" + std::to_string(quantity) +
         "&product=MIS&validity=DAY&price=" + orderPrice(limitPrice);
     const std::string response = httpRequest(
@@ -1207,6 +1292,10 @@ OrderResult KiteConnectApi::placeLimitExit(
     if (result.value("status", std::string()) != "success") {
         throw std::runtime_error("Kite did not accept the exit order");
     }
+    logLine("[kite_api] exit_order_accepted symbol=" + symbol +
+            " side=" +
+            (positionSide == PositionSide::Long ? "LONG" : "SHORT") +
+            " quantity=" + std::to_string(quantity));
     return {
         true,
         result.at("data").at("order_id").get<std::string>(),
@@ -1231,6 +1320,9 @@ BrokerOrderStatus KiteConnectApi::getOrderStatus(
     }
     const json& latest = history.back();
     const std::string status = latest.at("status").get<std::string>();
+    logLine("[kite_api] order_status_loaded status=" + status +
+            " filled_quantity=" +
+            std::to_string(latest.value("filled_quantity", 0)));
     return {
         status,
         latest.value("filled_quantity", 0),
@@ -1251,6 +1343,7 @@ void KiteConnectApi::cancelOrder(const std::string& orderId) {
     if (result.value("status", std::string()) != "success") {
         throw std::runtime_error("Kite did not confirm order cancellation");
     }
+    logLine("[kite_api] order_cancellation_confirmed");
 }
 
 bool KiteConnectApi::isHealthy() const {

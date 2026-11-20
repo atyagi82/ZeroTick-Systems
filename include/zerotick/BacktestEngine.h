@@ -9,9 +9,10 @@
 
 namespace zerotick {
 
-/** Result of simulating one completed long trade from historical candles. */
+/** Result of simulating one completed intraday position from historical candles. */
 struct BacktestTrade {
     std::string symbol;
+    PositionSide side = PositionSide::Long;
     std::string signalTime;
     std::string entryTime;
     std::string exitTime;
@@ -30,6 +31,9 @@ struct BacktestConfig {
     double initialCapital = 10000.0;
     std::size_t maxOpenPositions = kMaximumLivePositions;
     double fallbackTickSize = 0.01;
+    int entryTimeoutMinutes = 5;
+    std::string entryStartTime = "12:00";
+    std::string entryEndTime = "13:00";
     SelectionConfig selection;
     DecisionConfig decision;
 };
@@ -44,6 +48,8 @@ struct BacktestResult {
     std::size_t filledEntries = 0;
     std::size_t unfilledEntries = 0;
     std::size_t riskRejectedSignals = 0;
+    std::size_t positionLimitRejectedSignals = 0;
+    std::size_t insufficientBudgetRejectedSignals = 0;
     std::vector<BacktestTrade> trades;
 };
 

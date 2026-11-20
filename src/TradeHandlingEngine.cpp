@@ -13,22 +13,8 @@ double roundUpToTick(double price, double tick) {
     return std::ceil(price / tick - 1e-9) * tick;
 }
 
-double priceTick(const MarketSnapshot& snapshot) {
-    double smallestStep = 0.0;
-    for (std::size_t level = 1; level < 5; ++level) {
-        const double steps[] = {
-            snapshot.bidLevels[level - 1].price - snapshot.bidLevels[level].price,
-            snapshot.askLevels[level].price - snapshot.askLevels[level - 1].price
-        };
-        for (double step : steps) {
-            const double normalizedStep = std::round(step * 100.0) / 100.0;
-            if (normalizedStep > 0.0 &&
-                (smallestStep == 0.0 || normalizedStep < smallestStep)) {
-                smallestStep = normalizedStep;
-            }
-        }
-    }
-    return smallestStep > 0.0 ? smallestStep : 0.01;
+const char* sideName(PositionSide side) {
+    return side == PositionSide::Short ? "SHORT" : "LONG";
 }
 
 } // namespace
@@ -98,9 +84,9 @@ bool TradeHandlingEngine::waitForEntryFill(const std::string& orderId,
         try {
             status = api_.getOrderStatus(orderId);
         } catch (const std::exception& exception) {
-            zerotick::logLine("[handling] order=" + orderId +
-                              " status_poll_failed=\"" + exception.what() +
-                              "\"");
+            zerotick::logLine(
+                std::string("[handling] entry_status_poll_failed=\"") +
+                exception.what() + "\"");
             std::this_thread::sleep_for(config_.pollInterval);
             continue;
         }
@@ -149,7 +135,8 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
         outcome.stopLoss = false;
         outcome.reason = "paper_target";
         zerotick::logLine(
-            "[handling] symbol=" + symbol + " paper_exit qty=" +
+            "[handling] symbol=" + symbol + " side=" +
+            sideName(signal.side) + " paper_exit qty=" +
             std::to_string(quantity) + " price=" +
             std::to_string(outcome.exitPrice) + " reason=" + outcome.reason);
         portfolioRisk_.releaseSlot(symbol);
@@ -159,8 +146,10 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
 
     OrderResult exitOrder;
     try {
-        // The target is a broker limit order; stop monitoring remains local.
-        exitOrder = api_.placeLimitExit(symbol, quantity, signal.targetPrice);
+        // The position side determines the closing transaction: long exits
+        // sell, while short exits buy to cover.
+        exitOrder = api_.placeLimitExit(
+            symbol, quantity, signal.targetPrice, signal.side);
     } catch (const std::exception& exception) {
         zerotick::logLine(
             "[handling] symbol=" + symbol +
@@ -198,12 +187,17 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
         }
 
         try {
-            MarketSnapshot snapshot = api_.getQuote(symbol);
-            if (snapshot.lastPrice > 0.0 &&
-                snapshot.lastPrice <= signal.stopLossPrice && !stopLoss) {
+            MarketSnapshot snapshot =
+                api_.getQuote(symbol, config_.maxQuoteAge);
+            const bool stopTouched =
+                signal.side == PositionSide::Long
+                    ? snapshot.lastPrice <= signal.stopLossPrice
+                    : snapshot.lastPrice >= signal.stopLossPrice;
+            if (snapshot.lastPrice > 0.0 && stopTouched && !stopLoss) {
                 stopLoss = true;
                 try {
-                    // Replace the target order with an exit at the stop level.
+                    // Replace the target order with a closing order at the
+                    // stop level, using the side-aware exit transaction.
                     api_.cancelOrder(activeExitOrderId);
                 } catch (const std::exception&) {
                 }
@@ -211,11 +205,11 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
                     OrderResult stopExit = api_.placeLimitExit(
                         symbol,
                         remainingQuantity > 0 ? remainingQuantity : quantity,
-                        signal.stopLossPrice);
+                        signal.stopLossPrice, signal.side);
                     activeExitOrderId = stopExit.orderId;
                     zerotick::logLine(
                         "[handling] symbol=" + symbol +
-                        " stop_loss_hit exit_order=" + activeExitOrderId);
+                        " stop_loss_hit replacement_order_submitted");
                 } catch (const std::exception& exception) {
                     zerotick::logLine(
                         "[handling] symbol=" + symbol +
@@ -238,6 +232,7 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
     zerotick::logLine(
         "[handling] symbol=" + symbol + " entry_filled=" +
         (outcome.entryFilled ? "true" : "false") +
+        " side=" + sideName(signal.side) +
         " filled_qty=" + std::to_string(outcome.filledQuantity) +
         " entry_price=" + std::to_string(outcome.filledEntryPrice) +
         " exited=" + (outcome.exited ? "true" : "false") +
@@ -252,9 +247,18 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
 void TradeHandlingEngine::handleSignal(const TradeSignal& signal) {
     const std::string& symbol = signal.symbol;
 
+    if (signal.side == PositionSide::Short &&
+        !config_.allowShortSelling) {
+        zerotick::logLine(
+            "[handling] symbol=" + symbol +
+            " rejected=short_selling_disabled");
+        registry_.release(symbol, EngineId::Handling);
+        return;
+    }
+
     double freeCash = config_.liveTrading
                           ? api_.cashAvailability().freeCash
-                          : 100000.0;
+                          : config_.paperTradingCash;
     double slotBudget = 0.0;
     if (!portfolioRisk_.reserveSlot(symbol, freeCash, slotBudget)) {
         zerotick::logLine(
@@ -290,7 +294,7 @@ void TradeHandlingEngine::handleSignal(const TradeSignal& signal) {
         try {
             entryOrder = api_.placeStopLimitEntry(
                 symbol, quantity, signal.entryTriggerPrice,
-                signal.entryLimitPrice);
+                signal.entryLimitPrice, signal.side);
         } catch (const std::exception& exception) {
             zerotick::logLine(
                 "[handling] symbol=" + symbol +
@@ -304,7 +308,7 @@ void TradeHandlingEngine::handleSignal(const TradeSignal& signal) {
         if (!waitForEntryFill(entryOrder.orderId, status)) {
             zerotick::logLine(
                 "[handling] symbol=" + symbol +
-                " entry_not_filled order=" + entryOrder.orderId);
+                " entry_not_filled");
             try {
                 api_.cancelOrder(entryOrder.orderId);
             } catch (const std::exception&) {
@@ -329,7 +333,8 @@ void TradeHandlingEngine::handleSignal(const TradeSignal& signal) {
         entryPrice = signal.entryLimitPrice;
         filledQuantity = quantity;
         zerotick::logLine(
-            "[handling] symbol=" + symbol + " paper_entry qty=" +
+            "[handling] symbol=" + symbol + " side=" +
+            sideName(signal.side) + " paper_entry qty=" +
             std::to_string(filledQuantity) + " price=" +
             std::to_string(entryPrice));
     }

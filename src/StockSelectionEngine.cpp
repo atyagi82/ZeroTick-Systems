@@ -112,7 +112,7 @@ void StockSelectionEngine::workerLoop(std::size_t workerIndex) {
         const std::string& symbol = snapshot.symbol;
         // Never let delayed queue entries update selection state.
         if (std::chrono::steady_clock::now() - snapshot.receivedAt >
-            std::chrono::seconds(5)) {
+            config_.maxQuoteAge) {
             ++staleQuotes;
             bool firstStale = false;
             {
@@ -161,7 +161,7 @@ void StockSelectionEngine::workerLoop(std::size_t workerIndex) {
 double StockSelectionEngine::updateAverageVolume(
     const std::string& symbol, std::uint64_t volume) const {
     std::lock_guard<std::mutex> lock(volumeMutex_);
-    constexpr double alpha = 0.2;
+    const double alpha = config_.volumeEwmaAlpha;
     auto existing = averageVolume_.find(symbol);
     double avg = existing == averageVolume_.end() ? 0.0 : existing->second;
     const double current = static_cast<double>(volume);
@@ -267,15 +267,32 @@ bool StockSelectionEngine::evaluateSelection(
         return false;
     }
 
-    // Require a minimum positive move since the previous quote as well as an
-    // adequate intraday range; reject excessive movement/range as too volatile.
+    candidate.side = candidate.priceChangePercent < 0.0
+        ? PositionSide::Short
+        : PositionSide::Long;
+    const bool shortDisabled =
+        candidate.side == PositionSide::Short &&
+        !config_.allowShortSelling;
+    const bool momentumBelowThreshold =
+        candidate.side == PositionSide::Short
+            ? candidate.priceChangePercent >
+                  -config_.minPriceChangePercent
+            : candidate.priceChangePercent <
+                  config_.minPriceChangePercent;
+
+    // Require directional momentum and an adequate intraday range; reject
+    // excessive movement/range as too volatile.
     double rangePercent = 0.0;
     if (snapshot.highPrice > 0.0 && snapshot.lowPrice > 0.0) {
         rangePercent = (snapshot.highPrice - snapshot.lowPrice) /
                        snapshot.lowPrice * 100.0;
         candidate.intradayRangePercent = rangePercent;
     }
-    if (candidate.priceChangePercent < config_.minPriceChangePercent ||
+    if (shortDisabled) {
+        rejectionReason = "short_disabled";
+        return false;
+    }
+    if (momentumBelowThreshold ||
         rangePercent < config_.minIntradayRangePercent ||
         rangePercent > config_.maxPriceChangePercent ||
         std::abs(candidate.priceChangePercent) > config_.maxPriceChangePercent) {

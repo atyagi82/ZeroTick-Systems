@@ -40,6 +40,54 @@ and handling workers apply portfolio risk checks before paper or live
 execution. Selection logs aggregate results instead of printing one line per
 quote.
 
+## Algorithm configuration
+
+The application automatically loads `config.json` from the repository working
+directory at startup, including for backtests. Run the executable from the
+repository root to use the checked-in config and local `.env`:
+
+```powershell
+.\build\Release\zerotick.exe --backtest 2026-11-18
+```
+
+Edit `config.json` and restart the executable for changes to take effect; no
+rebuild is required. Settings are read once at startup and are not hot-reloaded.
+An alternate file can be selected with `--config`:
+
+```powershell
+.\build\Release\zerotick.exe --config .\my-config.json --backtest 2026-11-18
+```
+
+The config contains market-data polling, quote freshness and fallback tick
+size; selection thresholds and volume smoothing; decision filters, target and
+stop percentages, order-book weights and entry tick offsets; worker counts and
+order timeouts; live/paper risk limits and cash; and backtest capital, its
+independent position cap, and entry window. `risk.max_open_positions` applies
+to the live/paper pipeline; `backtest.max_open_positions` controls historical
+position sizing. Each backtest slot is capped at
+`backtest.initial_capital / backtest.max_open_positions`. Defaults include a
+0.30% target, 0.40% stop, INR 10,000 backtest capital, and a backtest-only
+new-entry window of 12:00–13:00 NSE time. The compiled fallback is 10
+backtest slots; the checked-in config sets one slot so the full INR 10,000 can
+size a trade. `risk.paper_trading_cash` does not change backtest capital.
+Backtest entry orders remain eligible for five minutes by default
+(`backtest.entry_timeout_minutes`), then expire if unfilled. This controls the
+entry order only; it does not set a minimum or maximum holding period for a
+filled position. `backtest.max_open_positions` limits simultaneous positions,
+not total trades per day; there is no daily trade-count cap.
+Unknown keys and invalid values stop startup with an error.
+
+Runtime and backtest diagnostics are appended to `logs.txt` in the working
+directory, with timestamps. The log records API operation names, HTTP status,
+response size and duration, plus backtest filter rejections, risk decisions,
+and entry/fill outcomes. It does not record API credentials, access tokens, or
+HTTP request/response bodies. `logs.txt` is local and ignored by Git.
+
+`--capital <amount>` overrides `backtest.initial_capital` for a backtest or
+100-day optimization run. Set `allow_short_selling` to `true` in the config or
+pass `--enable-shorts` to enable short entries. Live orders still require the
+separate `--enable-live-trading` flag.
+
 ## Historical candle backtest
 
 Run a one-minute OHLCV replay for a trading day. Capital defaults to ₹10,000,
@@ -56,6 +104,14 @@ Override the starting capital with:
 .\build\Release\zerotick.exe --backtest 2026-11-18 --capital 10000
 ```
 
+The historical simulator is long-only by default. To include short entries
+and buy-to-cover exits, opt in through `allow_short_selling` in `config.json`
+or pass:
+
+```powershell
+.\build\Release\zerotick.exe --backtest 2026-11-18 --capital 10000 --enable-shorts
+```
+
 For a parameter study over the latest 100 completed trading sessions, run:
 
 ```powershell
@@ -69,6 +125,7 @@ the current NIFTY 100 universe; expect a long run due to Kite's historical API
 rate limit. The delimited report compares the current defaults and ends with
 the training-selected candidate's total P&L across all 100 sessions.
 `--capital` can be used to change the starting balance.
+Add `--enable-shorts` to include the same short strategy in the study.
 
 The app gets NSE instrument tokens and tick sizes from Kite's instrument dump,
 then requests minute candles for the configured NIFTY 100 symbols. Requests
@@ -77,18 +134,28 @@ session and historical data for the requested trading day are required.
 `--backtest` never submits live orders and cannot be combined with
 `--enable-live-trading`.
 
+Historical backtests (including the 100-day study) only open new positions
+during the NSE-time window **12:00–13:00**. Signals and entry fills outside
+that window are ignored; positions opened inside it continue to be monitored
+for their target/stop and end-of-day exit. This is a time-of-day filter, not a
+measured volatility detector, and does not change live trading.
+
+Live short selling is disabled by default. Enable it through the config or
+`--enable-shorts`; live order submission still separately requires
+`--enable-live-trading`. Short MIS orders sell to enter and buy to cover at the
+target or stop. Broker margin/eligibility checks still apply; the position-size
+cap does not model broker-specific short margin requirements.
+
 This is an approximation, not an exact replay of live signals:
 
 - OHLCV candles have no historical bid/ask spread, displayed depth, or
   five-level imbalance; those filters are omitted rather than fabricated.
 - Signals are evaluated at a candle close and entries are tested against the
-  next candle. If a candle touches both stop and target, the stop is assumed
-  first. Positions still open at day end are closed at the final available
-  candle close.
-- The entry order is tested for one full next-candle interval, not the live
-  30-second timeout. Position sizing starts from the requested capital, with
-  up to ten simultaneous slots. P&L is gross; fees, taxes, and slippage are
-  excluded.
+  following one-minute candles until the configured entry timeout. If a candle
+  touches both stop and target, the stop is assumed first. Positions still
+  open at day end are closed at the final available candle close.
+- Position sizing starts from the requested capital with the configured number
+  of simultaneous slots. P&L is gross; fees, taxes, and slippage are excluded.
 - The replay uses the checked-in current NIFTY 100 list, not historical index
   membership, so earlier dates can have survivorship bias.
 - Optimization results are gross and exclude charges. A positive holdout
