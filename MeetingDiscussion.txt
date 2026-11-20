@@ -1,0 +1,49 @@
+21st November 2026
+
+HFT --> Brokerage XXXX , STT GS,  Kotak NEO --> Brokerage XXX, STT GST--> 0.03 percent --> 0.10 --> profit --> 0.07 percent * 0.60 = 0.042 %
+
+Latency to order, Latency for order to get executed,, Latency of Hardware and Networking
+
+HFT --> Corporate Trader --> Intraday Trading Possible
+
+Retail Investor --> Possible
+
+Insitution Investor --> Intraday XXXX--> Sell or Buy --> SEBI Illegal 
+
+Aim --> Trends --> Institution Investor--> Analysis --> Long Position
+
+Volumne Rise --> Sharply increase 1 percent, downwards --> sharply , slowly--> 
+
+Capital ---> Mindset --> Completly lost --> Most potential way
+
+Action items (Opens and do ASAP)
+
+@Manav 
+Strategy Parameters study
+Come up with some set of parameters and optimal range of values
+
+@Abhishek
+Study AI models relevant for usage and setup basics
+
+
+@Manav and Abhishek 
+Decision on Testing Strategy and Model
+
+@Abhishek 
+Execution of Testing Strategy
+---------------------
+DataSet Publish
+
+
+@Manav and @Abhishek
+Study Dataset
+
+@Manav
+Final initial Call
+
+@Abhishek
+Software architecture and integration improvent
+
+
+---------------------------------------------------------------------------
+
