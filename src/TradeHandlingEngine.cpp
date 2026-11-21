@@ -18,6 +18,20 @@ const char* sideName(PositionSide side) {
     return side == PositionSide::Short ? "SHORT" : "LONG";
 }
 
+double weightedImbalance(
+    const MarketSnapshot& snapshot,
+    const std::array<double, 5>& weights) {
+    double bid = 0.0;
+    double ask = 0.0;
+    for (std::size_t level = 0; level < weights.size(); ++level) {
+        bid += weights[level] *
+            static_cast<double>(snapshot.bidLevels[level].quantity);
+        ask += weights[level] *
+            static_cast<double>(snapshot.askLevels[level].quantity);
+    }
+    return bid + ask > 0.0 ? (bid - ask) / (bid + ask) : 0.0;
+}
+
 } // namespace
 
 TradeHandlingEngine::TradeHandlingEngine(
@@ -96,6 +110,8 @@ bool TradeHandlingEngine::waitForShadowEntry(
 
 void TradeHandlingEngine::manageShadowExit(
     const TradeSignal& signal, int quantity, double entryPrice) {
+    const auto entryTime = std::chrono::steady_clock::now();
+    std::size_t reversalCount = 0;
     while (!stopRequested_.load()) {
         try {
             const MarketSnapshot snapshot =
@@ -106,11 +122,26 @@ void TradeHandlingEngine::manageShadowExit(
             const bool targetTouched = signal.side == PositionSide::Long
                 ? snapshot.lastPrice >= signal.targetPrice
                 : snapshot.lastPrice <= signal.targetPrice;
-            if (stopTouched || targetTouched) {
+            const double imbalance = weightedImbalance(
+                snapshot, config_.imbalanceLevelWeights);
+            const bool reversalObserved =
+                config_.reversalImbalanceThreshold > 0.0 &&
+                (signal.side == PositionSide::Long
+                    ? imbalance <= -config_.reversalImbalanceThreshold
+                    : imbalance >= config_.reversalImbalanceThreshold);
+            reversalCount = reversalObserved ? reversalCount + 1 : 0;
+            const bool reversalExit =
+                reversalCount >= config_.reversalConfirmations;
+            const bool timeExit = config_.maxHoldingTime.count() > 0 &&
+                std::chrono::steady_clock::now() - entryTime >=
+                    config_.maxHoldingTime;
+            if (stopTouched || targetTouched || reversalExit || timeExit) {
                 double exitPrice = signal.side == PositionSide::Long
                     ? snapshot.bidPrice : snapshot.askPrice;
                 if (exitPrice <= 0.0) exitPrice = snapshot.lastPrice;
-                const std::string reason = stopTouched ? "stop_loss" : "target";
+                const std::string reason = stopTouched ? "stop_loss" :
+                    targetTouched ? "target" :
+                    reversalExit ? "imbalance_reversal" : "time_exit";
                 if (eventWriter_) {
                     eventWriter_->recordTradeEvent(
                         signal, "position_closed", quantity, exitPrice,
@@ -259,6 +290,10 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
     std::string reason = "timeout";
     std::string activeExitOrderId = exitOrder.orderId;
     int remainingQuantity = quantity;
+    const auto entryTime = std::chrono::steady_clock::now();
+    std::size_t reversalCount = 0;
+    bool replacementSubmitted = false;
+    std::string forcedExitReason;
 
     while (!stopRequested_.load()) {
         try {
@@ -275,7 +310,9 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
             reason = (status.status == "REJECTED" ||
                       status.status == "CANCELLED")
                          ? "rejected"
-                         : (stopLoss ? "stop_loss" : "target");
+                         : (!forcedExitReason.empty()
+                                ? forcedExitReason
+                                : "target");
             break;
         }
 
@@ -286,8 +323,26 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
                 signal.side == PositionSide::Long
                     ? snapshot.lastPrice <= signal.stopLossPrice
                     : snapshot.lastPrice >= signal.stopLossPrice;
-            if (snapshot.lastPrice > 0.0 && stopTouched && !stopLoss) {
-                stopLoss = true;
+            const double imbalance = weightedImbalance(
+                snapshot, config_.imbalanceLevelWeights);
+            const bool reversalObserved =
+                config_.reversalImbalanceThreshold > 0.0 &&
+                (signal.side == PositionSide::Long
+                    ? imbalance <= -config_.reversalImbalanceThreshold
+                    : imbalance >= config_.reversalImbalanceThreshold);
+            reversalCount = reversalObserved ? reversalCount + 1 : 0;
+            const bool reversalExit =
+                reversalCount >= config_.reversalConfirmations;
+            const bool timeExit = config_.maxHoldingTime.count() > 0 &&
+                std::chrono::steady_clock::now() - entryTime >=
+                    config_.maxHoldingTime;
+            if (snapshot.lastPrice > 0.0 &&
+                (stopTouched || reversalExit || timeExit) &&
+                !replacementSubmitted) {
+                stopLoss = stopTouched;
+                replacementSubmitted = true;
+                forcedExitReason = stopTouched ? "stop_loss" :
+                    reversalExit ? "imbalance_reversal" : "time_exit";
                 try {
                     // Replace the target order with a closing order at the
                     // stop level, using the side-aware exit transaction.
@@ -295,14 +350,23 @@ void TradeHandlingEngine::manageExit(const TradeSignal& signal, int quantity,
                 } catch (const std::exception&) {
                 }
                 try {
+                    double replacementPrice = stopTouched
+                        ? signal.stopLossPrice
+                        : (signal.side == PositionSide::Long
+                               ? snapshot.bidPrice
+                               : snapshot.askPrice);
+                    if (replacementPrice <= 0.0) {
+                        replacementPrice = snapshot.lastPrice;
+                    }
                     OrderResult stopExit = api_.placeLimitExit(
                         symbol,
                         remainingQuantity > 0 ? remainingQuantity : quantity,
-                        signal.stopLossPrice, signal.side);
+                        replacementPrice, signal.side);
                     activeExitOrderId = stopExit.orderId;
                     zerotick::logLine(
                         "[handling] symbol=" + symbol +
-                        " stop_loss_hit replacement_order_submitted");
+                        " exit_reason=" + forcedExitReason +
+                        " replacement_order_submitted");
                 } catch (const std::exception& exception) {
                     zerotick::logLine(
                         "[handling] symbol=" + symbol +

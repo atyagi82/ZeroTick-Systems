@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <limits>
 #include <map>
 #include <set>
@@ -28,6 +29,10 @@ struct SymbolState {
     double latestClose = 0.0;
     double latestSpreadPercent = 0.0;
     std::string latestTimestamp;
+    std::deque<std::pair<int, double>> priceHistory;
+    std::size_t confirmationCount = 0;
+    PositionSide confirmationSide = PositionSide::Long;
+    int lastQualifiedSecond = -2;
 };
 
 struct PendingEntry {
@@ -39,6 +44,7 @@ struct PendingEntry {
 
 struct OpenPosition {
     BacktestTrade trade;
+    std::size_t reversalConfirmationCount = 0;
 };
 
 double roundUpToTick(double price, double tickSize) {
@@ -216,12 +222,67 @@ void validateCandle(const std::string& symbol,
     }
 }
 
+bool historicalChangePercent(
+    const SymbolState& state, int currentSecond, std::size_t lookbackSeconds,
+    double currentPrice, double& changePercent) {
+    changePercent = 0.0;
+    if (lookbackSeconds == 0 || state.priceHistory.empty()) {
+        return false;
+    }
+    const int targetSecond = currentSecond -
+        static_cast<int>(lookbackSeconds);
+    for (auto observation = state.priceHistory.rbegin();
+         observation != state.priceHistory.rend(); ++observation) {
+        if (observation->first <= targetSecond && observation->second > 0.0) {
+            changePercent =
+                (currentPrice - observation->second) /
+                observation->second * 100.0;
+            return true;
+        }
+    }
+    return false;
+}
+
+double calculateTradeCharges(
+    const BacktestTrade& trade, const BacktestConfig& config) {
+    const double entryValue = trade.entryPrice * trade.quantity;
+    const double exitValue = trade.exitPrice * trade.quantity;
+    const double buyValue = trade.side == PositionSide::Long
+        ? entryValue : exitValue;
+    const double sellValue = trade.side == PositionSide::Long
+        ? exitValue : entryValue;
+    const auto brokerage = [&](double value) {
+        const double percentage =
+            value * config.brokerageRatePercent / 100.0;
+        return config.brokerageCapPerOrder > 0.0
+            ? std::min(percentage, config.brokerageCapPerOrder)
+            : percentage;
+    };
+    const double totalBrokerage =
+        brokerage(entryValue) + brokerage(exitValue);
+    const double turnover = buyValue + sellValue;
+    const double stt =
+        sellValue * config.sellSideSttPercent / 100.0;
+    const double transactionCharges =
+        turnover * config.transactionChargePercent / 100.0;
+    const double sebiCharges =
+        turnover * config.sebiChargePercent / 100.0;
+    const double stamp =
+        buyValue * config.buySideStampPercent / 100.0;
+    const double gst =
+        (totalBrokerage + transactionCharges + sebiCharges) *
+        config.gstPercent / 100.0;
+    return totalBrokerage + stt + transactionCharges +
+           sebiCharges + stamp + gst;
+}
+
 void closePosition(OpenPosition& position,
                    const std::string& exitTime,
                    double exitPrice,
                    const std::string& reason,
                    double& cash,
-                   BacktestResult& result) {
+                   BacktestResult& result,
+                   const BacktestConfig& config) {
     BacktestTrade trade = position.trade;
     trade.exitTime = exitTime;
     trade.exitPrice = exitPrice;
@@ -231,6 +292,8 @@ void closePosition(OpenPosition& position,
             ? trade.exitPrice - trade.entryPrice
             : trade.entryPrice - trade.exitPrice;
     trade.grossProfitLoss = positionChange * trade.quantity;
+    trade.charges = calculateTradeCharges(trade, config);
+    trade.netProfitLoss = trade.grossProfitLoss - trade.charges;
     logLine(
         "[backtest] position_closed symbol=" + trade.symbol +
         " side=" +
@@ -238,12 +301,18 @@ void closePosition(OpenPosition& position,
         " entry=" + std::to_string(trade.entryPrice) +
         " exit=" + std::to_string(trade.exitPrice) +
         " reason=" + reason +
-        " gross_pnl=" + std::to_string(trade.grossProfitLoss));
+        " gross_pnl=" + std::to_string(trade.grossProfitLoss) +
+        " charges=" + std::to_string(trade.charges) +
+        " net_pnl=" + std::to_string(trade.netProfitLoss));
     if (trade.side == PositionSide::Long) {
         cash += trade.exitPrice * trade.quantity;
     } else {
         cash -= trade.exitPrice * trade.quantity;
     }
+    cash -= trade.charges;
+    result.grossProfitLoss += trade.grossProfitLoss;
+    result.totalCharges += trade.charges;
+    result.netProfitLoss += trade.netProfitLoss;
     result.trades.push_back(std::move(trade));
 }
 
@@ -278,6 +347,7 @@ BacktestResult BacktestEngine::run(
         !std::isfinite(config.fallbackTickSize) ||
         config.fallbackTickSize <= 0.0 ||
         config.entryTimeoutMinutes <= 0 ||
+        config.entryTimeoutSeconds < 0 ||
         !std::isfinite(config.syntheticBaseSpreadPercent) ||
         !std::isfinite(config.syntheticVolatilitySpreadFactor) ||
         !std::isfinite(config.syntheticMaximumSpreadPercent) ||
@@ -291,6 +361,9 @@ BacktestResult BacktestEngine::run(
         parseClockTime(config.entryStartTime, "Backtest entry start");
     const int entryEndMinute =
         parseClockTime(config.entryEndTime, "Backtest entry end");
+    const int entryTimeoutSeconds = config.entryTimeoutSeconds > 0
+        ? config.entryTimeoutSeconds
+        : config.entryTimeoutMinutes * 60;
     if (entryStartMinute >= entryEndMinute) {
         throw std::invalid_argument(
             "Backtest entry window must start before it ends");
@@ -373,6 +446,11 @@ BacktestResult BacktestEngine::run(
         for (std::size_t index = groupStart; index < groupEnd; ++index) {
             const BarEvent& event = events[index];
             SymbolState& state = symbolStates[event.symbol];
+            if (!state.latestTimestamp.empty() &&
+                state.latestTimestamp.substr(0, 10) !=
+                    event.candle.timestamp.substr(0, 10)) {
+                state.priceHistory.clear();
+            }
             if (state.cumulativeVolume >
                 std::numeric_limits<std::uint64_t>::max() -
                     event.candle.volume) {
@@ -389,6 +467,17 @@ BacktestResult BacktestEngine::run(
             state.latestClose = event.candle.close;
             state.latestSpreadPercent = event.spreadPercent;
             state.latestTimestamp = event.candle.timestamp;
+            state.priceHistory.push_back(
+                std::make_pair(candleSecond, event.candle.close));
+            const std::size_t longestLookback = std::max(
+                config.selection.momentumLookbackSeconds,
+                config.selection.trendLookbackSeconds);
+            const int oldestNeeded = candleSecond -
+                static_cast<int>(longestLookback + 5);
+            while (state.priceHistory.size() > 2 &&
+                   state.priceHistory.front().first < oldestNeeded) {
+                state.priceHistory.pop_front();
+            }
             bars[event.symbol] = &event;
         }
 
@@ -403,7 +492,8 @@ BacktestResult BacktestEngine::run(
             blockedFromReselection.insert(positionEntry.first);
             const BarEvent& barEvent = *bar->second;
             const HistoricalCandle& candle = barEvent.candle;
-            const BacktestTrade& trade = positionEntry.second.trade;
+            OpenPosition& position = positionEntry.second;
+            const BacktestTrade& trade = position.trade;
             const PositionSide exitTransaction =
                 trade.side == PositionSide::Long
                     ? PositionSide::Short : PositionSide::Long;
@@ -434,7 +524,7 @@ BacktestResult BacktestEngine::run(
                                : trade.stopLossPrice);
                 closePosition(positionEntry.second,
                               candle.timestamp, exitPrice, "stop_loss",
-                              cash, result);
+                              cash, result, config);
                 positionsToClose.push_back(positionEntry.first);
             } else if (targetTouched) {
                 const double exitPrice =
@@ -447,8 +537,44 @@ BacktestResult BacktestEngine::run(
                                : trade.targetPrice);
                 closePosition(positionEntry.second,
                               candle.timestamp, exitPrice, "target",
-                              cash, result);
+                              cash, result, config);
                 positionsToClose.push_back(positionEntry.first);
+            } else {
+                double reversalMomentum = 0.0;
+                const SymbolState& state =
+                    symbolStates.at(positionEntry.first);
+                const bool momentumReady = historicalChangePercent(
+                    state, candleSecond,
+                    config.selection.momentumLookbackSeconds,
+                    candle.close, reversalMomentum);
+                const bool reversing = momentumReady &&
+                    (trade.side == PositionSide::Long
+                         ? reversalMomentum <=
+                               -config.selection.minPriceChangePercent
+                         : reversalMomentum >=
+                               config.selection.minPriceChangePercent);
+                position.reversalConfirmationCount = reversing
+                    ? position.reversalConfirmationCount + 1
+                    : 0;
+                const bool reversalConfirmed =
+                    position.reversalConfirmationCount >=
+                    config.decision.requiredConfirmations;
+                const int holdingSeconds = candleSecond -
+                    candleSecondOfDay(trade.entryTime);
+                const bool maximumHoldingReached =
+                    config.maxHoldingSeconds > 0 &&
+                    holdingSeconds >=
+                        static_cast<int>(config.maxHoldingSeconds);
+                if (reversalConfirmed || maximumHoldingReached) {
+                    const double exitPrice = executablePrice(
+                        candle.close, barEvent.spreadPercent,
+                        exitTransaction);
+                    closePosition(
+                        position, candle.timestamp, exitPrice,
+                        reversalConfirmed ? "momentum_reversal" : "time_exit",
+                        cash, result, config);
+                    positionsToClose.push_back(positionEntry.first);
+                }
             }
         }
         for (const std::string& symbol : positionsToClose) {
@@ -476,7 +602,7 @@ BacktestResult BacktestEngine::run(
             const bool sessionEnded = candleDate != pending.signalDate;
             const bool expiredBeforeThisBar =
                 !sessionEnded &&
-                elapsedSeconds > config.entryTimeoutMinutes * 60;
+                elapsedSeconds > entryTimeoutSeconds;
             if (sessionEnded || expiredBeforeThisBar) {
                 ++result.unfilledEntries;
                 logLine(
@@ -518,8 +644,9 @@ BacktestResult BacktestEngine::run(
                 } else {
                     cash += fillPrice * pending.trade.quantity;
                 }
-                openPositions[pendingEntry.first] =
-                    OpenPosition{pending.trade};
+                OpenPosition position;
+                position.trade = pending.trade;
+                openPositions[pendingEntry.first] = position;
                 ++result.filledEntries;
                 logLine(
                     "[backtest] entry_filled symbol=" + pending.trade.symbol +
@@ -534,7 +661,7 @@ BacktestResult BacktestEngine::run(
                 pendingToRemove.push_back(pendingEntry.first);
             } else {
                 const bool timeoutReached =
-                    elapsedSeconds >= config.entryTimeoutMinutes * 60;
+                    elapsedSeconds >= entryTimeoutSeconds;
                 const bool windowClosed = !entryWindowOpen;
                 const std::string reason = windowClosed
                     ? "entry_window_closed"
@@ -571,7 +698,7 @@ BacktestResult BacktestEngine::run(
                         " elapsed_seconds=" +
                         std::to_string(elapsedSeconds) +
                         " timeout_seconds=" +
-                        std::to_string(config.entryTimeoutMinutes * 60) +
+                        std::to_string(entryTimeoutSeconds) +
                         " reason=" + reason +
                         " high=" + std::to_string(candle.high) +
                         " low=" + std::to_string(candle.low) +
@@ -599,11 +726,25 @@ BacktestResult BacktestEngine::run(
             SymbolState& state = symbolStates[symbol];
             const HistoricalCandle& candle = event.candle;
             double priceChangePercent = 0.0;
-            if (state.previousClose > 0.0 &&
-                candle.timestamp > state.previousTimestamp) {
+            bool momentumReady = true;
+            if (config.selection.momentumLookbackSeconds > 0) {
+                momentumReady = historicalChangePercent(
+                    state, candleSecond,
+                    config.selection.momentumLookbackSeconds,
+                    candle.close, priceChangePercent);
+            } else if (state.previousClose > 0.0 &&
+                       candle.timestamp > state.previousTimestamp) {
                 priceChangePercent =
                     (candle.close - state.previousClose) /
                     state.previousClose * 100.0;
+            }
+            double trendChangePercent = priceChangePercent;
+            bool trendReady = true;
+            if (config.selection.trendLookbackSeconds > 0) {
+                trendReady = historicalChangePercent(
+                    state, candleSecond,
+                    config.selection.trendLookbackSeconds,
+                    candle.close, trendChangePercent);
             }
             // Advance the baseline before other gates, matching live selection:
             // rejected bars still become the reference for the next bar.
@@ -625,6 +766,12 @@ BacktestResult BacktestEngine::run(
                           -config.selection.minPriceChangePercent
                     : priceChangePercent <
                           config.selection.minPriceChangePercent;
+            const bool trendBelowThreshold =
+                side == PositionSide::Short
+                    ? trendChangePercent >
+                          -config.selection.minTrendChangePercent
+                    : trendChangePercent <
+                          config.selection.minTrendChangePercent;
             if (candle.close <= config.selection.minPrice) {
                 ++filterRejections["min_price"];
                 continue;
@@ -671,7 +818,15 @@ BacktestResult BacktestEngine::run(
                 ++filterRejections["decision_relative_volume"];
                 continue;
             }
-            if (momentumBelowThreshold) {
+            if (event.spreadPercent >
+                    config.selection.maxSpreadPercent ||
+                event.spreadPercent >
+                    config.decision.maximumSpreadPercent) {
+                ++filterRejections["spread_too_wide"];
+                continue;
+            }
+            if (!momentumReady || !trendReady || momentumBelowThreshold ||
+                trendBelowThreshold) {
                 ++filterRejections["directional_momentum"];
                 continue;
             }
@@ -690,6 +845,20 @@ BacktestResult BacktestEngine::run(
                 continue;
             }
 
+            const bool consecutiveQualification =
+                state.lastQualifiedSecond == candleSecond - 1 &&
+                state.confirmationSide == side;
+            state.confirmationCount = consecutiveQualification
+                ? state.confirmationCount + 1 : 1;
+            state.confirmationSide = side;
+            state.lastQualifiedSecond = candleSecond;
+            if (state.confirmationCount <
+                config.decision.requiredConfirmations) {
+                ++filterRejections["confirmation_wait"];
+                continue;
+            }
+            state.confirmationCount = 0;
+            state.lastQualifiedSecond = -2;
             // Candle data has no second quote within the same bar. Its close is
             // used for both selection and decision's non-falling-price check.
             ++result.generatedSignals;
@@ -802,8 +971,8 @@ BacktestResult BacktestEngine::run(
                 " side=" + (side == PositionSide::Short ? "SHORT" : "LONG") +
                 " quantity=" + std::to_string(pending.trade.quantity) +
                 " reserved_budget=" + std::to_string(slotBudget) +
-                " timeout_minutes=" +
-                std::to_string(config.entryTimeoutMinutes));
+                " timeout_seconds=" +
+                std::to_string(entryTimeoutSeconds));
         }
 
         const double equity = equityAtLatestCloses(
@@ -835,12 +1004,12 @@ BacktestResult BacktestEngine::run(
             state.latestClose, state.latestSpreadPercent, exitTransaction);
         closePosition(positionEntry.second,
                       state.latestTimestamp, exitPrice, "end_of_day",
-                      cash, result);
+                      cash, result, config);
     }
     openPositions.clear();
 
     result.endingCapital = cash;
-    result.grossProfitLoss = cash - result.initialCapital;
+    result.netProfitLoss = cash - result.initialCapital;
     const double finalEquity = cash;
     peakEquity = std::max(peakEquity, finalEquity);
     if (peakEquity > 0.0) {
@@ -860,7 +1029,10 @@ BacktestResult BacktestEngine::run(
         " signals=" + std::to_string(result.generatedSignals) +
         " fills=" + std::to_string(result.filledEntries) +
         " unfilled=" + std::to_string(result.unfilledEntries) +
-        " risk_rejected=" + std::to_string(result.riskRejectedSignals));
+        " risk_rejected=" + std::to_string(result.riskRejectedSignals) +
+        " gross_pnl=" + std::to_string(result.grossProfitLoss) +
+        " charges=" + std::to_string(result.totalCharges) +
+        " net_pnl=" + std::to_string(result.netProfitLoss));
     return result;
 }
 

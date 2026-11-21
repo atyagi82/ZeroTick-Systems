@@ -2,6 +2,7 @@
 #include "zerotick/Log.h"
 #include "zerotick/StructuredEventWriter.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <map>
@@ -196,38 +197,79 @@ double StockSelectionEngine::updateRelativeVolume(
     return avg > 0.0 ? current / avg : 0.0;
 }
 
-double StockSelectionEngine::priceChangePercent(
-    const MarketSnapshot& snapshot) const {
+bool StockSelectionEngine::priceChanges(
+    const MarketSnapshot& snapshot, double& momentumChangePercent,
+    double& trendChangePercent) const {
+    momentumChangePercent = 0.0;
+    trendChangePercent = 0.0;
     if (!std::isfinite(snapshot.lastPrice) || snapshot.lastPrice <= 0.0) {
-        return 0.0;
+        return false;
     }
 
     std::lock_guard<std::mutex> lock(priceMutex_);
-    auto existing = previousPrice_.find(snapshot.symbol);
-    if (existing == previousPrice_.end()) {
-        // The first valid quote establishes the baseline; it cannot establish
-        // positive momentum on its own.
+    std::deque<PriceObservation>& history = priceHistory_[snapshot.symbol];
+    if (!history.empty() &&
+        snapshot.receivedAt <= history.back().receivedAt) {
+        return false;
+    }
+    if (history.empty()) {
         PriceObservation observation;
         observation.price = snapshot.lastPrice;
         observation.receivedAt = snapshot.receivedAt;
-        previousPrice_.emplace(snapshot.symbol, observation);
-        return 0.0;
+        history.push_back(observation);
+        return false;
     }
 
-    // Multiple selection workers can dequeue successive snapshots concurrently.
-    // Do not let a delayed older snapshot roll a symbol's baseline backward.
-    if (snapshot.receivedAt <= existing->second.receivedAt) {
-        return 0.0;
+    const auto referenceFor = [&](std::size_t lookbackSeconds,
+                                  double& referencePrice) {
+        if (lookbackSeconds == 0) {
+            referencePrice = history.back().price;
+            return true;
+        }
+        const auto target = snapshot.receivedAt -
+            std::chrono::seconds(lookbackSeconds);
+        for (auto observation = history.rbegin();
+             observation != history.rend(); ++observation) {
+            if (observation->receivedAt <= target) {
+                referencePrice = observation->price;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    double momentumReference = 0.0;
+    double trendReference = 0.0;
+    const bool momentumReady = referenceFor(
+        config_.momentumLookbackSeconds, momentumReference);
+    const bool trendReady = config_.trendLookbackSeconds == 0 ||
+        referenceFor(config_.trendLookbackSeconds, trendReference);
+    if (momentumReady && momentumReference > 0.0) {
+        momentumChangePercent =
+            (snapshot.lastPrice - momentumReference) /
+            momentumReference * 100.0;
+    }
+    if (config_.trendLookbackSeconds == 0) {
+        trendChangePercent = momentumChangePercent;
+    } else if (trendReady && trendReference > 0.0) {
+        trendChangePercent =
+            (snapshot.lastPrice - trendReference) /
+            trendReference * 100.0;
     }
 
-    const double previous = existing->second.price;
-    const double change =
-        previous > 0.0
-            ? (snapshot.lastPrice - previous) / previous * 100.0
-            : 0.0;
-    existing->second.price = snapshot.lastPrice;
-    existing->second.receivedAt = snapshot.receivedAt;
-    return change;
+    PriceObservation observation;
+    observation.price = snapshot.lastPrice;
+    observation.receivedAt = snapshot.receivedAt;
+    history.push_back(observation);
+    const std::size_t longestLookback = std::max(
+        config_.momentumLookbackSeconds, config_.trendLookbackSeconds);
+    const auto oldestNeeded = snapshot.receivedAt -
+        std::chrono::seconds(longestLookback + 5);
+    while (history.size() > 2 &&
+           history.front().receivedAt < oldestNeeded) {
+        history.pop_front();
+    }
+    return momentumReady && trendReady;
 }
 
 bool StockSelectionEngine::evaluateSelection(
@@ -236,7 +278,9 @@ bool StockSelectionEngine::evaluateSelection(
     const std::string& symbol = snapshot.symbol;
     // Track every newer valid quote, even if a later liquidity or volume check
     // rejects it, so momentum always compares adjacent quote observations.
-    candidate.priceChangePercent = priceChangePercent(snapshot);
+    const bool momentumReady = priceChanges(
+        snapshot, candidate.priceChangePercent,
+        candidate.trendChangePercent);
 
     // Reject low-priced instruments before doing the more expensive filters.
     if (snapshot.lastPrice <= config_.minPrice) {
@@ -297,6 +341,12 @@ bool StockSelectionEngine::evaluateSelection(
                   -config_.minPriceChangePercent
             : candidate.priceChangePercent <
                   config_.minPriceChangePercent;
+    const bool trendBelowThreshold =
+        candidate.side == PositionSide::Short
+            ? candidate.trendChangePercent >
+                  -config_.minTrendChangePercent
+            : candidate.trendChangePercent <
+                  config_.minTrendChangePercent;
 
     // Require directional momentum and an adequate intraday range; reject
     // excessive movement/range as too volatile.
@@ -310,7 +360,7 @@ bool StockSelectionEngine::evaluateSelection(
         rejectionReason = "short_disabled";
         return false;
     }
-    if (momentumBelowThreshold ||
+    if (!momentumReady || momentumBelowThreshold || trendBelowThreshold ||
         rangePercent < config_.minIntradayRangePercent ||
         rangePercent > config_.maxPriceChangePercent ||
         std::abs(candidate.priceChangePercent) > config_.maxPriceChangePercent) {

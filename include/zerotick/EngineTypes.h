@@ -46,6 +46,7 @@ struct StockCandidate {
     std::uint64_t volume = 0;
     double relativeVolume = 0.0;
     double priceChangePercent = 0.0;
+    double trendChangePercent = 0.0;
     double spreadPercent = 0.0;
     double bidQuantity = 0.0;
     double askQuantity = 0.0;
@@ -90,6 +91,9 @@ struct SelectionConfig {
     double maxSpreadPercent = 0.20;           // liquidity ceiling
     double minDepthQuantity = 1000.0;         // min bid/ask book depth
     double minPriceChangePercent = 0.05;      // minimum directional move
+    std::size_t momentumLookbackSeconds = 0; // 0 retains adjacent-quote mode
+    std::size_t trendLookbackSeconds = 0;    // 0 disables trend alignment
+    double minTrendChangePercent = 0.0;
     double maxPriceChangePercent = 6.0;       // maximum move/range in percent
     double minIntradayRangePercent = 0.30;    // enough intraday range to trade
     double volumeEwmaAlpha = 0.2;
@@ -123,12 +127,16 @@ struct HandlingConfig {
     std::chrono::milliseconds pollInterval{1000};
     std::chrono::seconds entryFillTimeout{30};
     std::chrono::seconds exitFillTimeout{30};
+    std::chrono::seconds maxHoldingTime{0};
     std::chrono::seconds maxQuoteAge{5};
     std::size_t workerCount = 4;
     double paperTradingCash = 100000.0;
     bool liveTrading = false;
     bool shadowLiveSimulation = false;
     bool allowShortSelling = false;           // final live/paper execution guard
+    double reversalImbalanceThreshold = 0.0;
+    std::size_t reversalConfirmations = 1;
+    std::array<double, 5> imbalanceLevelWeights{{1.0, 0.8, 0.6, 0.4, 0.2}};
 };
 
 /** Source of the tradable universe (e.g. NIFTY 100 constituents). */

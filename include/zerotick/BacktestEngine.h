@@ -25,6 +25,8 @@ struct BacktestTrade {
     double stopLossPrice = 0.0;
     double exitPrice = 0.0;
     double grossProfitLoss = 0.0;
+    double charges = 0.0;
+    double netProfitLoss = 0.0;
 };
 
 struct BacktestConfig {
@@ -32,12 +34,21 @@ struct BacktestConfig {
     std::size_t maxOpenPositions = kMaximumLivePositions;
     double fallbackTickSize = 0.01;
     int entryTimeoutMinutes = 5;
+    int entryTimeoutSeconds = 0;
     std::string entryStartTime = "12:00";
     std::string entryEndTime = "13:00";
     bool synthesizeOneSecondQuotes = false;
     double syntheticBaseSpreadPercent = 0.02;
     double syntheticVolatilitySpreadFactor = 0.05;
     double syntheticMaximumSpreadPercent = 0.20;
+    int maxHoldingSeconds = 0;
+    double brokerageRatePercent = 0.03;
+    double brokerageCapPerOrder = 20.0;
+    double sellSideSttPercent = 0.025;
+    double transactionChargePercent = 0.00307;
+    double sebiChargePercent = 0.0001;
+    double buySideStampPercent = 0.003;
+    double gstPercent = 18.0;
     SelectionConfig selection;
     DecisionConfig decision;
 };
@@ -46,6 +57,8 @@ struct BacktestResult {
     double initialCapital = 0.0;
     double endingCapital = 0.0;
     double grossProfitLoss = 0.0;
+    double totalCharges = 0.0;
+    double netProfitLoss = 0.0;
     double maxDrawdownPercent = 0.0;
     std::size_t candleCount = 0;
     std::size_t replayEventCount = 0;

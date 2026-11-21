@@ -103,7 +103,7 @@ void printBacktestSummary(
     const zerotick::BacktestResult& result) {
     std::size_t winningTrades = 0;
     for (const zerotick::BacktestTrade& trade : result.trades) {
-        if (trade.grossProfitLoss > 0.0) {
+        if (trade.netProfitLoss > 0.0) {
             ++winningTrades;
         }
     }
@@ -112,7 +112,7 @@ void printBacktestSummary(
         : static_cast<double>(winningTrades) /
               static_cast<double>(result.trades.size()) * 100.0;
     const double returnPercent =
-        result.grossProfitLoss / result.initialCapital * 100.0;
+        result.netProfitLoss / result.initialCapital * 100.0;
 
     const auto sessionTime = [](const std::string& timestamp) {
         if (timestamp.size() >= 19 && timestamp[10] == 'T') {
@@ -137,7 +137,10 @@ void printBacktestSummary(
               << config.initialCapital /
                      static_cast<double>(config.maxOpenPositions)
               << "; pending-entry timeout: "
-              << config.entryTimeoutMinutes << " minute(s)\n"
+              << (config.entryTimeoutSeconds > 0
+                      ? config.entryTimeoutSeconds
+                      : config.entryTimeoutMinutes * 60)
+              << " second(s)\n"
               << "\nClosed trades (times shown as HH:MM:SS):\n"
               << std::left
               << std::setw(4) << "#"
@@ -180,7 +183,10 @@ void printBacktestSummary(
 
     std::cout << "\nStarting capital: INR " << result.initialCapital << "\n"
               << "Ending capital: INR " << result.endingCapital << "\n"
-              << "Gross return: " << returnPercent << "%\n"
+              << "Net return: " << returnPercent << "%\n"
+              << "Gross P&L: INR " << std::showpos
+              << result.grossProfitLoss << std::noshowpos << "\n"
+              << "Estimated charges: INR " << result.totalCharges << "\n"
               << "Max drawdown: " << result.maxDrawdownPercent << "%\n"
               << "Signals: " << result.generatedSignals
               << ", filled entries: " << result.filledEntries
@@ -194,10 +200,10 @@ void printBacktestSummary(
               << ", winners: " << winningTrades
               << ", win rate: " << winRate << "%\n"
               << "Symbols without candle data: " << symbolsWithoutData << "\n"
-              << "Approximation: spread is estimated; depth, imbalance, "
-                 "fees, and additional slippage are not modeled.\n"
-              << "TOTAL PROFIT / LOSS: INR " << std::showpos
-              << result.grossProfitLoss << std::noshowpos << '\n';
+              << "Approximation: spread and statutory charges are estimated; "
+                 "depth, imbalance, and additional slippage are not modeled.\n"
+              << "TOTAL NET PROFIT / LOSS: INR " << std::showpos
+              << result.netProfitLoss << std::noshowpos << '\n';
 }
 
 struct SegmentStats {
@@ -352,11 +358,11 @@ void addTradeStats(SegmentStats& stats,
                    const std::vector<zerotick::BacktestTrade>& trades) {
     for (const zerotick::BacktestTrade& trade : trades) {
         ++stats.trades;
-        if (trade.grossProfitLoss > 0.0) {
+        if (trade.netProfitLoss > 0.0) {
             ++stats.winners;
-            stats.grossProfit += trade.grossProfitLoss;
-        } else if (trade.grossProfitLoss < 0.0) {
-            stats.grossLoss += -trade.grossProfitLoss;
+            stats.grossProfit += trade.netProfitLoss;
+        } else if (trade.netProfitLoss < 0.0) {
+            stats.grossLoss += -trade.netProfitLoss;
         }
     }
 }
@@ -509,12 +515,13 @@ void printOptimizationResults(
                   << std::noshowpos << ".\n";
     }
     if (bestHoldoutPnl <= 0.0) {
-        std::cout << "The training-selected candidate was not gross "
+        std::cout << "The training-selected candidate was not net "
                      "profitable on holdout; this sweep provides no basis "
                      "for claiming profitability.\n";
     }
-    std::cout << "Results are gross: fees, taxes, and slippage are excluded. "
-                 "Holdout drawdown is based on daily closing equity.\n"
+    std::cout << "Results include configured brokerage and statutory charges; "
+                 "additional slippage remains excluded. Holdout drawdown is "
+                 "based on daily closing equity.\n"
               << "TRAIN-SELECTED TOTAL P&L (100 sessions): INR "
               << std::showpos << bestTotalPnl << std::noshowpos << '\n';
 }
@@ -574,7 +581,6 @@ void runOptimizationStudy(
                     std::to_string(symbols.size()));
             }
         }
-
         while (nextSession < sessions.size() &&
                sessions[nextSession] <= chunkEnd) {
             const std::string& date = sessions[nextSession];
@@ -592,7 +598,6 @@ void runOptimizationStudy(
                 throw std::runtime_error(
                     "No universe candles were returned for session " + date);
             }
-
             for (OptimizationVariant& variant : variants) {
                 zerotick::BacktestConfig dailyConfig = variant.config;
                 dailyConfig.initialCapital = variant.capital;

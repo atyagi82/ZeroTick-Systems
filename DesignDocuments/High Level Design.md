@@ -2,14 +2,15 @@
 
 **Project:** ZeroTick-Systems  
 **Status:** Prototype  
-**Design snapshot:** 2026-11-19
+**Design snapshot:** 2026-11-22
 
 ## 1. Purpose and scope
 
 ZeroTick-Systems is a Windows C++ application that retrieves NSE market data
 from Zerodha Kite Connect, filters a configured stock universe, evaluates
-potential long entries, optionally submits and manages MIS orders, and
-supports a separate historical-candle backtest mode.
+potential long and short entries, optionally submits and manages MIS orders,
+records structured shadow-live events, and supports historical replay and
+parameter-study modes.
 
 This document describes the event-driven runtime wired by `src/main.cpp`:
 quote delivery, stock selection, trade decisions, and trade handling.
@@ -30,7 +31,7 @@ flowchart LR
     Orders[Broker order and position services]
     Env[.env or process environment]
 
-    Operator -->|run flags and stop signal| App
+    Operator -->|config file and stop signal| App
     Env -->|API key, secret, access token| App
     App -->|open login URL| Browser
     Browser -->|localhost callback| App
@@ -47,11 +48,13 @@ not be committed or printed in logs.
 Algorithm settings are loaded at startup from `config.json` in the working
 directory, or from the file supplied with `--config <path>`. The file controls
 selection and decision thresholds, volume smoothing and book-imbalance
-weights, quote freshness, tick offsets, target/stop percentages, worker and
-polling settings, position and paper-cash limits, short-selling opt-in, and
-backtest capital and entry window. Invalid or unknown settings stop startup
-with an error. Editing the file takes effect on the next executable start;
-live order submission still separately requires `--enable-live-trading`.
+weights, quote freshness, tick offsets,
+target/stop percentages, worker and polling settings, position and paper-cash
+limits, short-selling opt-in, and backtest execution/cost assumptions. Invalid
+or unknown settings stop startup with an error. Editing the file takes effect
+on the next executable start and does not require rebuilding. Only
+`--config <path>` remains as a command-line override; real order submission
+requires both `run.mode: "live"` and `run.live_trading_confirmed: true`.
 
 ## 3. Runtime architecture
 
@@ -105,9 +108,9 @@ sequenceDiagram
     participant D as Decision workers
     participant H as Handling workers
 
-    Main->>Kite: Authenticate and refresh NIFTY 100 in chunks
+    Main->>Kite: Authenticate and refresh NIFTY 100
     Kite-->>Main: Cache quotes and return available snapshots
-    Main->>Q: Enqueue each returned snapshot
+    Main->>Q: Enqueue returned stock snapshots
     S->>Q: Wait for next snapshot
     Q-->>S: MarketSnapshot
     S->>R: Unassigned -> Selection
@@ -115,7 +118,7 @@ sequenceDiagram
     S->>D: Enqueue StockCandidate if eligible
     D->>R: Selection -> Decision
     D->>Kite: Re-read fresh quote from cache
-    D->>D: Re-check spread, volume, imbalance, price
+    D->>D: Re-check spread, volume, imbalance, price three times
     D->>H: Enqueue TradeSignal if approved
     H->>R: Decision -> Handling
     H->>H: Reserve risk slot and size order
@@ -155,8 +158,8 @@ the same time.
 Selection narrows fresh market snapshots to directional candidates, then
 decision rechecks each candidate before creating a long or short signal.
 Short selling is disabled unless opted in through `allow_short_selling` in the
-runtime config or `--enable-shorts`. Neither stage submits orders; execution
-and risk checks remain in `TradeHandlingEngine`.
+runtime config. Neither stage submits orders; execution and risk checks remain
+in `TradeHandlingEngine`.
 
 ### Stock selection
 
@@ -168,10 +171,11 @@ filters in order:
 | Last price must be greater than the minimum | 100 |
 | Symbol must belong to the configured universe | NIFTY 100 required |
 | Cumulative session volume | At least 50,000 |
-| Relative volume | At least 1.5 |
-| Best bid/ask spread | No more than 0.20% |
+| Relative volume | At least 1.2 |
+| Best bid/ask spread | No more than 0.03% |
 | Displayed bid and ask depth | At least 1,000 on each side |
-| Directional change from previous newer quote | At least 0.05% in the selected direction |
+| 30-second directional momentum | At least 0.12% in the selected direction |
+| 120-second trend alignment | At least 0.06% in the selected direction |
 | Intraday high/low range | 0.30% to 6.0% |
 | Absolute change from previous quote | No more than 6.0% |
 
@@ -189,33 +193,36 @@ and is not inserted as an interval. A session-volume reset establishes a new
 baseline. This measures activity between polls; it is not a historical
 time-of-day volume profile.
 
-Price movement is computed from the last price and receipt time of the
-previous newer quote for that symbol:
+Price movement is computed from timestamped per-symbol history. The checked-in
+profile compares the latest price with 30-second and 120-second references:
 
 ```text
-priceChangePercent = (last_t - last_(t-1)) / last_(t-1) * 100
+momentumPercent    = (last_t - last_(t-30s)) / last_(t-30s) * 100
+trendPercent       = (last_t - last_(t-120s)) / last_(t-120s) * 100
 rangePercent       = (high - low) / low * 100
 spreadPercent      = (ask - bid) / ((ask + bid) / 2) * 100
 ```
 
-The first valid quote seeds the price baseline and cannot pass the 0.05%
-movement gate by itself. A newer quote advances the baseline even when another
-selection filter rejects it; an out-of-order quote cannot move that baseline
-backward. A candidate is sent to decision only after all selection gates pass.
+History is bounded to the longest configured lookback plus a small margin.
+Quotes cannot qualify until both references exist. A newer quote advances
+history even when another selection filter rejects it; an out-of-order quote
+cannot move history backward. A candidate is sent to decision only after all
+selection gates pass.
 Upward momentum produces a long candidate. Downward momentum produces a short
 candidate only when short selling is explicitly enabled.
 
 ### Trade decision
 
-For each candidate, decision reads a cached quote no older than five seconds
-and requires:
+For each candidate, decision requires three newer cached-quote confirmations
+at the configured interval. Each quote must be no older than five seconds and
+must satisfy:
 
-- Fresh spread no greater than **0.10%**.
-- Candidate relative volume of at least **1.2** when volume confirmation is
+- Fresh spread no greater than **0.03%**.
+- Candidate relative volume of at least **1.5** when volume confirmation is
   enabled (enabled by default).
-- Long: weighted bid-side imbalance at least **+0.05** and fresh price not
+- Long: weighted bid-side imbalance at least **+0.15** and fresh price not
   below the selected price.
-- Short (explicit opt-in): weighted imbalance at most **-0.05** and fresh
+- Short (explicit opt-in): weighted imbalance at most **-0.15** and fresh
   price not above the selected price.
 
 The five-level imbalance weights nearer levels more heavily; each weight is
@@ -231,56 +238,47 @@ If these checks pass, decision creates a directional `TradeSignal`; it does
 not place an order. Tick size is inferred from adjacent depth prices, with a
 configurable `0.01` fallback. Entry trigger and limit offsets are configurable
 in ticks. Long entries trigger above the ask and target higher;
-short entries trigger below the bid and target lower. The target is 0.30% and
-the stop is 0.40%, mirrored around entry. Decision attaches an indicative
+short entries trigger below the bid and target lower. The checked-in target is
+0.50% and the stop is 0.25%, mirrored around entry. Decision attaches an indicative
 quantity based on a configurable 50,000 budget; handling recalculates quantity
 against the portfolio slot and may reject it.
 
-The current decision stage evaluates one fresh quote per candidate; it does
-not wait for multiple-snapshot confirmation.
-
 ### Historical backtest mode
 
-`--backtest YYYY-MM-DD` downloads one-minute OHLCV candles for the configured
-NIFTY 100 symbols using Kite's historical API, then replays the available
-selection and decision rules with default capital of 10,000. The NSE
-instrument dump supplies instrument tokens and tick sizes. Trade details are
-printed as an aligned console table, followed by a summary whose final line is
-the total profit or loss.
+With `run.mode: "backtest"`, `main` downloads one-minute OHLCV candles for the
+configured NIFTY 100 universe. Each source
+minute is normally expanded into a deterministic 60-event path that preserves
+its OHLC and total volume. This makes second-based momentum, confirmation,
+entry timeout, and maximum-holding rules comparable with the live strategy;
+it does not reconstruct the unknowable true tick path.
 
-Historical replays, including `--optimize-100-days`, only open new positions
-from **12:00 to 13:00 NSE time**. This time-of-day proxy avoids the opening
-period; it is not a measured volatility threshold. Positions already opened
-remain subject to target/stop monitoring and end-of-day closure outside this
-window. This filter does not affect live trading.
+Historical candles contain no order book. Displayed depth and five-level
+imbalance are therefore omitted, while spread is estimated from a configurable
+base plus candle volatility and capped at a configured maximum. The estimate
+participates in both liquidity filtering and executable bid/ask prices.
+Pending stop-limit entries expire after the configured seconds; target, stop,
+momentum reversal, and maximum holding time manage filled positions. Ambiguous
+stop/target bars remain conservative (stop first).
 
-This is not a full-depth replay: candles contain no historical spread, depth,
-or five-level imbalance, so those gates are omitted. Signals are evaluated at
-bar close, and pending entries are checked against following one-minute bars
-for up to the configured entry timeout (five minutes by default). Ambiguous
-stop/target bars assume stop-first, and remaining positions close at the end
-of the day. The backtest entry timeout differs from the live 30-second timeout.
-Fees and slippage are excluded. The backtest uses the current NIFTY 100 list
-for earlier dates and may therefore have survivorship bias. Backtest mode
-cannot submit live orders.
-`--enable-shorts` includes short signals in backtests and optimization runs;
-in live mode it is an additional explicit opt-in required alongside
-`--enable-live-trading`. Short MIS trades sell to enter and buy to cover. The
-share-count sizing cap does not model broker-specific short margin requirements.
+The simulator deducts configured brokerage, sell-side STT, exchange and SEBI
+charges, buy-side stamp duty, and GST. It reports gross P&L, charges, and net
+P&L separately. Additional slippage, historical depth, and exact queue
+position are not modeled. Current NIFTY 100 membership is reused for earlier
+dates and can introduce survivorship bias.
 
-`--optimize-100-days` fetches the latest 100 completed sessions in weekly
-chunks and evaluates 20 predefined selection/exit combinations. The first 70
-sessions are used for ranking; the last 30 are reported as holdout results.
-This is a bounded diagnostic sweep, not a guarantee of profitability.
+`run.mode: "optimize_100_days"` uses the same execution and cost model while
+evaluating the bounded train/holdout parameter study. Neither
+historical mode can submit broker orders.
 
 ## 7. Trading modes and safety boundary
 
-- **Default mode:** `liveTrading` is false; no broker orders are submitted by
-  `TradeHandlingEngine`.
-- **Live mode:** `--enable-live-trading` enables real Kite MIS order submission.
+- **Paper/shadow mode:** no broker orders are submitted by
+  `TradeHandlingEngine`; shadow mode records structured JSONL events.
+- **Live mode:** `run.mode: "live"` enables real Kite MIS order submission only
+  when `run.live_trading_confirmed` is also true.
   Startup checks for existing MIS positions and open orders, reads available
-  cash, and applies the configured maximum reserved position slots (10 by
-  default).
+  cash, and applies the configured maximum reserved position slots (20 in the
+  checked-in profile).
 - The application monitors target and stop conditions in-process. These are
   not broker-hosted OCO/bracket protections; a crash, network issue, or
   shutdown can leave broker state requiring manual review.
@@ -304,8 +302,8 @@ Run from the repository root so `.env` can be loaded:
 .\build\Release\zerotick.exe
 ```
 
-`--login` forces a fresh browser login. `--enable-live-trading` is a separate
-explicit option that can submit real orders.
+Runtime behavior belongs in `config.json`; only `--config <path>` is accepted
+as a command-line override. Set `run.force_login` to force browser login.
 
 ## 9. Current limitations
 

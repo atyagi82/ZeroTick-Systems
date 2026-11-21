@@ -77,19 +77,61 @@ void TradingDecisionEngine::workerLoop() {
         }
 
         MarketSnapshot fresh;
-        try {
-            fresh = api_.getQuote(candidate.symbol, config_.maxQuoteAge);
-        } catch (const std::exception& exception) {
-            zerotick::logLine(
-                "[decision] symbol=" + candidate.symbol +
-                " quote_failed=\"" + exception.what() + "\"");
-            registry_.release(candidate.symbol, EngineId::Decision);
-            continue;
-        }
-
         TradeSignal signal;
         std::string rejectionReason;
-        if (evaluateDecision(candidate, fresh, signal, rejectionReason)) {
+        bool confirmed = true;
+        std::chrono::steady_clock::time_point previousReceipt;
+        for (std::size_t confirmation = 0;
+             confirmation < config_.requiredConfirmations;
+             ++confirmation) {
+            if (confirmation > 0) {
+                const auto deadline = std::chrono::steady_clock::now() +
+                    config_.pollInterval * 2;
+                do {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(50));
+                    try {
+                        fresh = api_.getQuote(
+                            candidate.symbol, config_.maxQuoteAge);
+                    } catch (const std::exception&) {
+                        continue;
+                    }
+                } while (!stopRequested_.load() &&
+                         fresh.receivedAt <= previousReceipt &&
+                         std::chrono::steady_clock::now() < deadline);
+                if (fresh.receivedAt <= previousReceipt) {
+                    rejectionReason = "confirmation_quote_not_updated";
+                    confirmed = false;
+                    break;
+                }
+            } else {
+                try {
+                    fresh = api_.getQuote(
+                        candidate.symbol, config_.maxQuoteAge);
+                } catch (const std::exception& exception) {
+                    zerotick::logLine(
+                        "[decision] symbol=" + candidate.symbol +
+                        " quote_failed=\"" + exception.what() + "\"");
+                    rejectionReason = "quote_failed";
+                    confirmed = false;
+                    break;
+                }
+            }
+            previousReceipt = fresh.receivedAt;
+            TradeSignal confirmationSignal;
+            if (!evaluateDecision(
+                    candidate, fresh, confirmationSignal,
+                    rejectionReason)) {
+                confirmed = false;
+                break;
+            }
+            signal = confirmationSignal;
+            if (confirmation + 1 < config_.requiredConfirmations) {
+                std::this_thread::sleep_for(config_.pollInterval);
+            }
+        }
+
+        if (confirmed) {
             signal.candidateId = candidate.candidateId;
             if (eventWriter_) {
                 signal.signalId = eventWriter_->recordDecision(
@@ -105,7 +147,9 @@ void TradingDecisionEngine::workerLoop() {
                 " limit=" + std::to_string(signal.entryLimitPrice) +
                 " target=" + std::to_string(signal.targetPrice) +
                 " stop=" + std::to_string(signal.stopLossPrice) +
-                " qty=" + std::to_string(signal.quantity));
+                " qty=" + std::to_string(signal.quantity) +
+                " confirmations=" +
+                std::to_string(config_.requiredConfirmations));
         } else {
             if (eventWriter_) {
                 eventWriter_->recordDecision(

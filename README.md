@@ -199,11 +199,12 @@ This remains an approximation, not an exact replay of live signals:
 - The true price and volume sequence inside each source minute is unknowable.
   The generated path is reproducible but represents only one plausible path.
 - Position sizing starts from the requested capital with the configured number
-  of simultaneous slots. P&L is gross; fees, taxes, and slippage are excluded.
+  of simultaneous slots. Configured brokerage and statutory charges are
+  deducted; additional slippage remains excluded.
 - The replay uses the checked-in current NIFTY 100 list, not historical index
   membership, so earlier dates can have survivorship bias.
-- Optimization results are gross and exclude charges. A positive holdout
-  result is not a guarantee of future performance.
+- Optimization results include configured charges. A positive holdout result
+  is not a guarantee of future performance.
 
 The table shows each closed trade's symbol, signal/entry/exit time, quantity,
 entry/exit price, gross P&L, and exit reason. The summary includes return,

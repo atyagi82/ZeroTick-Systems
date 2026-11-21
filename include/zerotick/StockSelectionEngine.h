@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -60,7 +61,9 @@ private:
         std::chrono::steady_clock::time_point receivedAt;
     };
 
-    double priceChangePercent(const MarketSnapshot& snapshot) const;
+    bool priceChanges(const MarketSnapshot& snapshot,
+                      double& momentumChangePercent,
+                      double& trendChangePercent) const;
 
     ThreadSafeQueue<MarketSnapshot>& quoteUpdates_;
     StockEngineRegistry& registry_;
@@ -76,7 +79,8 @@ private:
     mutable std::unordered_map<std::string, double> averageVolume_;
     mutable std::unordered_map<std::string, std::uint64_t> previousVolume_;
     mutable std::mutex priceMutex_;
-    mutable std::unordered_map<std::string, PriceObservation> previousPrice_;
+    mutable std::unordered_map<std::string,
+                               std::deque<PriceObservation>> priceHistory_;
 };
 
 } // namespace zerotick
