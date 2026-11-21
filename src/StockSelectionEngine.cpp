@@ -169,22 +169,31 @@ void StockSelectionEngine::workerLoop(std::size_t workerIndex) {
     logSummary();
 }
 
-double StockSelectionEngine::updateAverageVolume(
-    const std::string& symbol, std::uint64_t volume) const {
+double StockSelectionEngine::updateRelativeVolume(
+    const std::string& symbol, std::uint64_t cumulativeVolume) const {
     std::lock_guard<std::mutex> lock(volumeMutex_);
+    const auto previous = previousVolume_.find(symbol);
+    if (previous == previousVolume_.end() ||
+        cumulativeVolume < previous->second) {
+        previousVolume_[symbol] = cumulativeVolume;
+        averageVolume_.erase(symbol);
+        return 1.0;
+    }
+    const std::uint64_t intervalVolume =
+        cumulativeVolume - previous->second;
+    previousVolume_[symbol] = cumulativeVolume;
+
     const double alpha = config_.volumeEwmaAlpha;
     auto existing = averageVolume_.find(symbol);
     double avg = existing == averageVolume_.end() ? 0.0 : existing->second;
-    const double current = static_cast<double>(volume);
-    // The snapshots carry cumulative session volume; smooth successive samples
-    // rather than treating the value as an independent per-period volume.
+    const double current = static_cast<double>(intervalVolume);
     if (avg <= 0.0) {
         avg = current;
     } else {
         avg = alpha * current + (1.0 - alpha) * avg;
     }
     averageVolume_[symbol] = avg;
-    return avg;
+    return avg > 0.0 ? current / avg : 0.0;
 }
 
 double StockSelectionEngine::priceChangePercent(
@@ -250,10 +259,8 @@ bool StockSelectionEngine::evaluateSelection(
         rejectionReason = "absolute_volume";
         return false;
     }
-    double avgVolume = updateAverageVolume(symbol, snapshot.volume);
-    // The EWMA includes this snapshot, so the first sample has a ratio of 1.0.
     candidate.relativeVolume =
-        avgVolume > 0.0 ? static_cast<double>(snapshot.volume) / avgVolume : 1.0;
+        updateRelativeVolume(symbol, snapshot.volume);
     if (candidate.relativeVolume < config_.minRelativeVolume) {
         rejectionReason = "relative_volume";
         return false;

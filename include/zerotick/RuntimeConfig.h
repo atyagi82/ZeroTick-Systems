@@ -9,7 +9,24 @@
 
 namespace zerotick {
 
+enum class RunMode {
+    Paper,
+    ShadowLive,
+    Backtest,
+    Optimize100Days,
+    Live
+};
+
+struct RunConfig {
+    RunMode mode = RunMode::Paper;
+    bool forceLogin = false;
+    bool liveTradingConfirmed = false;
+    std::string backtestDate;
+    std::string dataOutputPath = "shadow_live_events.jsonl";
+};
+
 struct RuntimeConfig {
+    RunConfig run;
     SelectionConfig selection;
     DecisionConfig decision;
     HandlingConfig handling;

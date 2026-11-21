@@ -134,9 +134,10 @@ For each snapshot:
 | Intraday range must meet the minimum | 0.30% |
 | Intraday range and absolute price change must not exceed the maximum | 6.0% |
 
-Relative volume uses an exponentially weighted average with `alpha = 0.2`.
-The average is updated from cumulative volume snapshots before computing the
-ratio, so the first observed volume has a relative volume of 1.0.
+Relative volume uses volume added since the previous cumulative quote and an
+exponentially weighted average with `alpha = 0.2`. The first cumulative sample
+establishes the baseline with relative volume 1.0 and is not inserted as an
+interval, so it cannot dominate later samples.
 
 Price movement compares each valid quote with the previous newer quote for
 that symbol. The first quote seeds the baseline and cannot qualify by itself.

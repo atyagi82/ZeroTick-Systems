@@ -15,6 +15,7 @@ namespace {
 struct BarEvent {
     std::string symbol;
     HistoricalCandle candle;
+    double spreadPercent = 0.0;
 };
 
 struct SymbolState {
@@ -25,6 +26,7 @@ struct SymbolState {
     double sessionHigh = 0.0;
     double sessionLow = 0.0;
     double latestClose = 0.0;
+    double latestSpreadPercent = 0.0;
     std::string latestTimestamp;
 };
 
@@ -32,7 +34,7 @@ struct PendingEntry {
     BacktestTrade trade;
     double reservedBudget = 0.0;
     std::string signalDate;
-    int signalMinute = 0;
+    int signalSecond = 0;
 };
 
 struct OpenPosition {
@@ -66,14 +68,137 @@ int parseClockTime(const std::string& value, const std::string& description) {
     return hour * 60 + minute;
 }
 
-int candleMinuteOfDay(const std::string& timestamp) {
-    if (timestamp.size() < 16 || timestamp[10] != 'T' ||
-        timestamp[13] != ':') {
+int candleSecondOfDay(const std::string& timestamp) {
+    if (timestamp.size() < 19 || timestamp[10] != 'T' ||
+        timestamp[13] != ':' || timestamp[16] != ':') {
         throw std::invalid_argument(
-            "Historical candle timestamp must include ISO HH:MM time");
+            "Historical candle timestamp must include ISO HH:MM:SS time");
     }
-    return parseClockTime(timestamp.substr(11, 5),
-                          "Historical candle time");
+    const int minute = parseClockTime(timestamp.substr(11, 5),
+                                      "Historical candle time");
+    if (timestamp[17] < '0' || timestamp[17] > '9' ||
+        timestamp[18] < '0' || timestamp[18] > '9') {
+        throw std::invalid_argument("Historical candle has invalid seconds");
+    }
+    const int second = (timestamp[17] - '0') * 10 + timestamp[18] - '0';
+    if (second > 59) {
+        throw std::invalid_argument("Historical candle seconds exceed 59");
+    }
+    return minute * 60 + second;
+}
+
+std::string timestampAtSecond(const std::string& timestamp, int second) {
+    std::string result = timestamp;
+    result[17] = static_cast<char>('0' + second / 10);
+    result[18] = static_cast<char>('0' + second % 10);
+    return result;
+}
+
+double interpolate(double left, double right, double fraction) {
+    return left + (right - left) * fraction;
+}
+
+std::uint64_t stableHash(const std::string& value) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char character : value) {
+        hash ^= character;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::vector<HistoricalCandle> synthesizeSeconds(
+    const std::string& symbol, const HistoricalCandle& minute) {
+    constexpr int count = 60;
+    const std::uint64_t seed = stableHash(symbol + minute.timestamp);
+    const bool highFirst = (seed & 1ULL) != 0;
+    const double firstExtreme = highFirst ? minute.high : minute.low;
+    const double secondExtreme = highFirst ? minute.low : minute.high;
+    const double anchors[] = {
+        minute.open, firstExtreme, secondExtreme, minute.close
+    };
+    const int anchorSeconds[] = {0, 20, 40, 59};
+    const double range = minute.high - minute.low;
+    std::vector<HistoricalCandle> seconds;
+    seconds.reserve(count);
+    std::vector<double> volumeWeights;
+    volumeWeights.reserve(count);
+    double totalVolumeWeight = 0.0;
+    double previous = minute.open;
+    for (int second = 0; second < count; ++second) {
+        int segment = second <= 20 ? 0 : second <= 40 ? 1 : 2;
+        const int segmentStart = anchorSeconds[segment];
+        const int segmentEnd = anchorSeconds[segment + 1];
+        const double fraction = segmentEnd > segmentStart
+            ? static_cast<double>(second - segmentStart) /
+                  static_cast<double>(segmentEnd - segmentStart)
+            : 0.0;
+        double close = interpolate(
+            anchors[segment], anchors[segment + 1], fraction);
+        if (second != segmentStart && second != segmentEnd && range > 0.0) {
+            const double envelope = std::sin(3.141592653589793 * fraction);
+            const double wave = std::sin(
+                (static_cast<double>(second) +
+                 static_cast<double>(seed % 23ULL)) * 2.399963229728653);
+            close += range * 0.04 * envelope * wave;
+            close = std::max(minute.low, std::min(minute.high, close));
+        }
+        if (second == 0) close = minute.open;
+        if (second == 20) close = firstExtreme;
+        if (second == 40) close = secondExtreme;
+        if (second == 59) close = minute.close;
+
+        HistoricalCandle generated;
+        generated.timestamp = timestampAtSecond(minute.timestamp, second);
+        generated.open = previous;
+        generated.close = close;
+        generated.high = std::max(previous, close);
+        generated.low = std::min(previous, close);
+        const std::uint64_t volumeSeed = stableHash(
+            symbol + minute.timestamp + std::to_string(second));
+        const double randomWeight =
+            static_cast<double>(volumeSeed % 1000ULL) / 999.0;
+        const double moveFraction = range > 0.0
+            ? std::abs(close - previous) / range
+            : 0.0;
+        const double volumeWeight =
+            0.20 + 2.0 * randomWeight + 8.0 * moveFraction;
+        volumeWeights.push_back(volumeWeight);
+        totalVolumeWeight += volumeWeight;
+        seconds.push_back(generated);
+        previous = close;
+    }
+    double cumulativeWeight = 0.0;
+    std::uint64_t assignedVolume = 0;
+    for (int second = 0; second < count; ++second) {
+        cumulativeWeight += volumeWeights[second];
+        const std::uint64_t targetVolume = second + 1 == count
+            ? minute.volume
+            : static_cast<std::uint64_t>(
+                  static_cast<double>(minute.volume) * cumulativeWeight /
+                  totalVolumeWeight);
+        seconds[second].volume = targetVolume - assignedVolume;
+        assignedVolume = targetVolume;
+    }
+    return seconds;
+}
+
+double estimatedSpreadPercent(
+    const HistoricalCandle& candle, const BacktestConfig& config) {
+    const double rangePercent = candle.low > 0.0
+        ? (candle.high - candle.low) / candle.low * 100.0
+        : 0.0;
+    return std::min(
+        config.syntheticMaximumSpreadPercent,
+        config.syntheticBaseSpreadPercent +
+            rangePercent * config.syntheticVolatilitySpreadFactor);
+}
+
+double executablePrice(double mid, double spreadPercent, PositionSide side) {
+    const double halfSpread = spreadPercent / 200.0;
+    return side == PositionSide::Long
+        ? mid * (1.0 + halfSpread)
+        : mid * (1.0 - halfSpread);
 }
 
 void validateCandle(const std::string& symbol,
@@ -152,7 +277,14 @@ BacktestResult BacktestEngine::run(
         config.maxOpenPositions == 0 ||
         !std::isfinite(config.fallbackTickSize) ||
         config.fallbackTickSize <= 0.0 ||
-        config.entryTimeoutMinutes <= 0) {
+        config.entryTimeoutMinutes <= 0 ||
+        !std::isfinite(config.syntheticBaseSpreadPercent) ||
+        !std::isfinite(config.syntheticVolatilitySpreadFactor) ||
+        !std::isfinite(config.syntheticMaximumSpreadPercent) ||
+        config.syntheticBaseSpreadPercent < 0.0 ||
+        config.syntheticVolatilitySpreadFactor < 0.0 ||
+        config.syntheticMaximumSpreadPercent <
+            config.syntheticBaseSpreadPercent) {
         throw std::invalid_argument("Invalid backtest capital or position limit");
     }
     const int entryStartMinute =
@@ -165,6 +297,7 @@ BacktestResult BacktestEngine::run(
     }
 
     std::vector<BarEvent> events;
+    std::size_t sourceCandleCount = 0;
     for (const auto& symbolData : candlesBySymbol) {
         if (!universe.contains(symbolData.first)) {
             continue;
@@ -179,12 +312,22 @@ BacktestResult BacktestEngine::run(
         std::string previousTimestamp;
         for (const HistoricalCandle& candle : candles) {
             validateCandle(symbolData.first, candle);
+            ++sourceCandleCount;
             if (candle.timestamp == previousTimestamp) {
                 throw std::invalid_argument(
                     "Duplicate historical candle for " + symbolData.first);
             }
             previousTimestamp = candle.timestamp;
-            events.push_back({symbolData.first, candle});
+            const double spread = estimatedSpreadPercent(candle, config);
+            if (config.synthesizeOneSecondQuotes) {
+                const std::vector<HistoricalCandle> generated =
+                    synthesizeSeconds(symbolData.first, candle);
+                for (const HistoricalCandle& second : generated) {
+                    events.push_back({symbolData.first, second, spread});
+                }
+            } else {
+                events.push_back({symbolData.first, candle, spread});
+            }
         }
     }
     if (events.empty()) {
@@ -202,7 +345,8 @@ BacktestResult BacktestEngine::run(
 
     BacktestResult result;
     result.initialCapital = config.initialCapital;
-    result.candleCount = events.size();
+    result.candleCount = sourceCandleCount;
+    result.replayEventCount = events.size();
     double cash = config.initialCapital;
     double reservedPendingBudget = 0.0;
     double peakEquity = config.initialCapital;
@@ -215,16 +359,16 @@ BacktestResult BacktestEngine::run(
     while (groupStart < events.size()) {
         std::size_t groupEnd = groupStart + 1;
         const std::string timestamp = events[groupStart].candle.timestamp;
-        const int candleMinute = candleMinuteOfDay(timestamp);
+        const int candleSecond = candleSecondOfDay(timestamp);
         const bool entryWindowOpen =
-            candleMinute >= entryStartMinute &&
-            candleMinute < entryEndMinute;
+            candleSecond >= entryStartMinute * 60 &&
+            candleSecond < entryEndMinute * 60;
         while (groupEnd < events.size() &&
                events[groupEnd].candle.timestamp == timestamp) {
             ++groupEnd;
         }
 
-        std::map<std::string, const HistoricalCandle*> bars;
+        std::map<std::string, const BarEvent*> bars;
         std::set<std::string> blockedFromReselection;
         for (std::size_t index = groupStart; index < groupEnd; ++index) {
             const BarEvent& event = events[index];
@@ -243,8 +387,9 @@ BacktestResult BacktestEngine::run(
                 ? event.candle.low
                 : std::min(state.sessionLow, event.candle.low);
             state.latestClose = event.candle.close;
+            state.latestSpreadPercent = event.spreadPercent;
             state.latestTimestamp = event.candle.timestamp;
-            bars[event.symbol] = &event.candle;
+            bars[event.symbol] = &event;
         }
 
         // Existing positions are checked before new signals, so a freed slot
@@ -256,26 +401,36 @@ BacktestResult BacktestEngine::run(
                 continue;
             }
             blockedFromReselection.insert(positionEntry.first);
-            const HistoricalCandle& candle = *bar->second;
+            const BarEvent& barEvent = *bar->second;
+            const HistoricalCandle& candle = barEvent.candle;
             const BacktestTrade& trade = positionEntry.second.trade;
+            const PositionSide exitTransaction =
+                trade.side == PositionSide::Long
+                    ? PositionSide::Short : PositionSide::Long;
+            const double executableLow = executablePrice(
+                candle.low, barEvent.spreadPercent, exitTransaction);
+            const double executableHigh = executablePrice(
+                candle.high, barEvent.spreadPercent, exitTransaction);
+            const double executableOpen = executablePrice(
+                candle.open, barEvent.spreadPercent, exitTransaction);
             const bool stopTouched =
                 trade.side == PositionSide::Long
-                    ? candle.low <= trade.stopLossPrice
-                    : candle.high >= trade.stopLossPrice;
+                    ? executableLow <= trade.stopLossPrice
+                    : executableHigh >= trade.stopLossPrice;
             const bool targetTouched =
                 trade.side == PositionSide::Long
-                    ? candle.high >= trade.targetPrice
-                    : candle.low <= trade.targetPrice;
+                    ? executableHigh >= trade.targetPrice
+                    : executableLow <= trade.targetPrice;
             if (stopTouched) {
                 // OHLC bars do not show whether target or stop traded first;
                 // assume the stop wins if both occur in one candle.
                 const double exitPrice =
                     trade.side == PositionSide::Long
-                        ? (candle.open < trade.stopLossPrice
-                               ? candle.open
+                        ? (executableOpen < trade.stopLossPrice
+                               ? executableOpen
                                : trade.stopLossPrice)
-                        : (candle.open > trade.stopLossPrice
-                               ? candle.open
+                        : (executableOpen > trade.stopLossPrice
+                               ? executableOpen
                                : trade.stopLossPrice);
                 closePosition(positionEntry.second,
                               candle.timestamp, exitPrice, "stop_loss",
@@ -284,11 +439,11 @@ BacktestResult BacktestEngine::run(
             } else if (targetTouched) {
                 const double exitPrice =
                     trade.side == PositionSide::Long
-                        ? (candle.open > trade.targetPrice
-                               ? candle.open
+                        ? (executableOpen > trade.targetPrice
+                               ? executableOpen
                                : trade.targetPrice)
-                        : (candle.open < trade.targetPrice
-                               ? candle.open
+                        : (executableOpen < trade.targetPrice
+                               ? executableOpen
                                : trade.targetPrice);
                 closePosition(positionEntry.second,
                               candle.timestamp, exitPrice, "target",
@@ -309,18 +464,19 @@ BacktestResult BacktestEngine::run(
                 continue;
             }
             blockedFromReselection.insert(pendingEntry.first);
-            const HistoricalCandle& candle = *bar->second;
+            const BarEvent& barEvent = *bar->second;
+            const HistoricalCandle& candle = barEvent.candle;
             PendingEntry& pending = pendingEntry.second;
             const std::string candleDate = candle.timestamp.substr(0, 10);
-            const int elapsedMinutes =
-                candleMinute - pending.signalMinute;
-            if (candleDate == pending.signalDate && elapsedMinutes <= 0) {
+            const int elapsedSeconds =
+                candleSecond - pending.signalSecond;
+            if (candleDate == pending.signalDate && elapsedSeconds <= 0) {
                 continue;
             }
             const bool sessionEnded = candleDate != pending.signalDate;
             const bool expiredBeforeThisBar =
                 !sessionEnded &&
-                elapsedMinutes > config.entryTimeoutMinutes;
+                elapsedSeconds > config.entryTimeoutMinutes * 60;
             if (sessionEnded || expiredBeforeThisBar) {
                 ++result.unfilledEntries;
                 logLine(
@@ -329,25 +485,28 @@ BacktestResult BacktestEngine::run(
                     " time=" + candle.timestamp +
                     " reason=" +
                     (sessionEnded ? "session_ended" : "timeout") +
-                    " elapsed_minutes=" + std::to_string(elapsedMinutes));
+                    " elapsed_seconds=" + std::to_string(elapsedSeconds));
                 reservedPendingBudget -= pending.reservedBudget;
                 pendingToRemove.push_back(pendingEntry.first);
                 continue;
             }
+            const double executableOpen = executablePrice(
+                candle.open, barEvent.spreadPercent, pending.trade.side);
             const bool gapBeyondLimit =
                 pending.trade.side == PositionSide::Long
-                    ? candle.open > pending.trade.entryLimitPrice
-                    : candle.open < pending.trade.entryLimitPrice;
+                    ? executableOpen > pending.trade.entryLimitPrice
+                    : executableOpen < pending.trade.entryLimitPrice;
             const bool triggerReached =
                 pending.trade.side == PositionSide::Long
                     ? candle.high >= pending.trade.entryTriggerPrice
                     : candle.low <= pending.trade.entryTriggerPrice;
+            const double executableTrigger = executablePrice(
+                pending.trade.entryTriggerPrice,
+                barEvent.spreadPercent, pending.trade.side);
             const double fillPrice =
                 pending.trade.side == PositionSide::Long
-                    ? std::max(candle.open,
-                               pending.trade.entryTriggerPrice)
-                    : std::min(candle.open,
-                               pending.trade.entryTriggerPrice);
+                    ? std::max(executableOpen, executableTrigger)
+                    : std::min(executableOpen, executableTrigger);
             if (entryWindowOpen && !gapBeyondLimit && triggerReached &&
                 (pending.trade.side == PositionSide::Long
                      ? fillPrice <= pending.trade.entryLimitPrice
@@ -375,7 +534,7 @@ BacktestResult BacktestEngine::run(
                 pendingToRemove.push_back(pendingEntry.first);
             } else {
                 const bool timeoutReached =
-                    elapsedMinutes >= config.entryTimeoutMinutes;
+                    elapsedSeconds >= config.entryTimeoutMinutes * 60;
                 const bool windowClosed = !entryWindowOpen;
                 const std::string reason = windowClosed
                     ? "entry_window_closed"
@@ -393,8 +552,8 @@ BacktestResult BacktestEngine::run(
                         pending.trade.symbol +
                         " time=" + candle.timestamp +
                         " reason=" + reason +
-                        " elapsed_minutes=" +
-                        std::to_string(elapsedMinutes) +
+                        " elapsed_seconds=" +
+                        std::to_string(elapsedSeconds) +
                         " open=" + std::to_string(candle.open) +
                         " high=" + std::to_string(candle.high) +
                         " low=" + std::to_string(candle.low) +
@@ -409,10 +568,10 @@ BacktestResult BacktestEngine::run(
                         "[backtest] entry_waiting symbol=" +
                         pending.trade.symbol +
                         " time=" + candle.timestamp +
-                        " elapsed_minutes=" +
-                        std::to_string(elapsedMinutes) +
-                        " timeout_minutes=" +
-                        std::to_string(config.entryTimeoutMinutes) +
+                        " elapsed_seconds=" +
+                        std::to_string(elapsedSeconds) +
+                        " timeout_seconds=" +
+                        std::to_string(config.entryTimeoutMinutes * 60) +
                         " reason=" + reason +
                         " high=" + std::to_string(candle.high) +
                         " low=" + std::to_string(candle.low) +
@@ -486,7 +645,7 @@ BacktestResult BacktestEngine::run(
             }
 
             const double currentVolume =
-                static_cast<double>(state.cumulativeVolume);
+                static_cast<double>(candle.volume);
             if (state.averageVolume <= 0.0) {
                 state.averageVolume = currentVolume;
             } else {
@@ -635,7 +794,7 @@ BacktestResult BacktestEngine::run(
             pending.trade.quantity = static_cast<int>(cappedValue);
             pending.reservedBudget = slotBudget;
             pending.signalDate = candle.timestamp.substr(0, 10);
-            pending.signalMinute = candleMinute;
+            pending.signalSecond = candleSecond;
             reservedPendingBudget += slotBudget;
             pendingEntries[symbol] = pending;
             logLine(
@@ -669,8 +828,13 @@ BacktestResult BacktestEngine::run(
     // intraday MIS simulation and the selected date has ended.
     for (auto& positionEntry : openPositions) {
         const SymbolState& state = symbolStates.at(positionEntry.first);
+        const PositionSide exitTransaction =
+            positionEntry.second.trade.side == PositionSide::Long
+                ? PositionSide::Short : PositionSide::Long;
+        const double exitPrice = executablePrice(
+            state.latestClose, state.latestSpreadPercent, exitTransaction);
         closePosition(positionEntry.second,
-                      state.latestTimestamp, state.latestClose, "end_of_day",
+                      state.latestTimestamp, exitPrice, "end_of_day",
                       cash, result);
     }
     openPositions.clear();
@@ -690,6 +854,9 @@ BacktestResult BacktestEngine::run(
     }
     logLine(
         "[backtest] completed candles=" + std::to_string(result.candleCount) +
+        " replay_events=" + std::to_string(result.replayEventCount) +
+        " one_second_replay=" +
+        (config.synthesizeOneSecondQuotes ? "enabled" : "disabled") +
         " signals=" + std::to_string(result.generatedSignals) +
         " fills=" + std::to_string(result.filledEntries) +
         " unfilled=" + std::to_string(result.unfilledEntries) +

@@ -175,18 +175,19 @@ filters in order:
 | Intraday high/low range | 0.30% to 6.0% |
 | Absolute change from previous quote | No more than 6.0% |
 
-The volume baseline is an EWMA of cumulative quote-volume samples with
-configurable `alpha` (default `0.2`):
+The volume baseline is an EWMA of volume added between consecutive quote
+samples with configurable `alpha` (default `0.2`):
 
 ```text
-average_t      = 0.2 * volume_t + 0.8 * average_(t-1)
-relativeVolume = volume_t / average_t
+intervalVolume = cumulativeVolume_t - cumulativeVolume_(t-1)
+average_t      = 0.2 * intervalVolume + 0.8 * average_(t-1)
+relativeVolume = intervalVolume / average_t
 ```
 
-The current sample is included in the EWMA before computing the ratio, so the
-first sample has relative volume 1.0. This is a comparison of successive
-cumulative-volume snapshots, not a time-normalized or historical-volume
-profile.
+The first cumulative sample establishes a baseline with relative volume 1.0
+and is not inserted as an interval. A session-volume reset establishes a new
+baseline. This measures activity between polls; it is not a historical
+time-of-day volume profile.
 
 Price movement is computed from the last price and receipt time of the
 previous newer quote for that symbol:
@@ -313,8 +314,9 @@ explicit option that can submit real orders.
 - There is no market-hours or holiday gate. A REST response timestamp reflects
   when the application received the quote, not necessarily when the exchange
   last changed the market data.
-- The relative-volume filter compares cumulative volume with an EWMA updated
-  on each quote event. This can stay near 1.0 when volume is not increasing.
+- The relative-volume filter compares volume added between polls with an EWMA
+  of prior intervals; it is sensitive to polling cadence and is not normalized
+  against a historical time-of-day profile.
 - Quote-to-quote movement uses local receipt order, not exchange event time.
 - Paper and live behavior are covered by fakes/unit tests, not by a complete
   market replay or end-to-end live-order validation.

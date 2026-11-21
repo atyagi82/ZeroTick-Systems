@@ -168,6 +168,31 @@ void validateClockTime(const std::string& value, const std::string& name) {
     }
 }
 
+RunMode parseRunMode(const std::string& value) {
+    if (value == "paper") return RunMode::Paper;
+    if (value == "shadow_live") return RunMode::ShadowLive;
+    if (value == "backtest") return RunMode::Backtest;
+    if (value == "optimize_100_days") return RunMode::Optimize100Days;
+    if (value == "live") return RunMode::Live;
+    throw std::invalid_argument(
+        "run.mode must be paper, shadow_live, backtest, "
+        "optimize_100_days, or live");
+}
+
+void validateBacktestDate(const std::string& value) {
+    if (value.size() != 10 || value[4] != '-' || value[7] != '-') {
+        throw std::invalid_argument(
+            "run.backtest_date must use YYYY-MM-DD format");
+    }
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (index != 4 && index != 7 &&
+            (value[index] < '0' || value[index] > '9')) {
+            throw std::invalid_argument(
+                "run.backtest_date must use YYYY-MM-DD format");
+        }
+    }
+}
+
 } // namespace
 
 RuntimeConfig parseRuntimeConfig(const std::string& contents) {
@@ -185,11 +210,37 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
     }
     rejectUnknownKeys(
         root,
-        {"allow_short_selling", "market_data", "selection", "decision",
+        {"run", "allow_short_selling", "market_data", "selection", "decision",
          "handling", "risk", "backtest"},
         "root");
 
     RuntimeConfig config;
+
+    const Json& run = objectSection(root, "run");
+    rejectUnknownKeys(
+        run,
+        {"mode", "force_login", "live_trading_confirmed",
+         "backtest_date", "data_output_path"},
+        "run");
+    std::string runMode = "paper";
+    readValue(run, "mode", runMode, "run");
+    config.run.mode = parseRunMode(runMode);
+    readValue(run, "force_login", config.run.forceLogin, "run");
+    readValue(run, "live_trading_confirmed",
+              config.run.liveTradingConfirmed, "run");
+    readValue(run, "backtest_date", config.run.backtestDate, "run");
+    readValue(run, "data_output_path", config.run.dataOutputPath, "run");
+    if (config.run.mode == RunMode::Backtest) {
+        validateBacktestDate(config.run.backtestDate);
+    }
+    if (config.run.mode == RunMode::Live &&
+        !config.run.liveTradingConfirmed) {
+        throw std::invalid_argument(
+            "run.live_trading_confirmed must be true for live mode");
+    }
+    if (config.run.dataOutputPath.empty()) {
+        throw std::invalid_argument("run.data_output_path must not be empty");
+    }
     readValue(root, "allow_short_selling", config.allowShortSelling, "root");
 
     const Json& marketData = objectSection(root, "market_data");
@@ -343,7 +394,10 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
     rejectUnknownKeys(
         backtest,
         {"initial_capital", "max_open_positions",
-         "entry_timeout_minutes", "entry_start_time", "entry_end_time"},
+         "entry_timeout_minutes", "entry_start_time", "entry_end_time",
+         "synthesize_one_second_quotes", "synthetic_base_spread_percent",
+         "synthetic_volatility_spread_factor",
+         "synthetic_maximum_spread_percent"},
         "backtest");
     readValue(backtest, "initial_capital",
               config.backtest.initialCapital, "backtest");
@@ -355,6 +409,14 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
               config.backtest.entryStartTime, "backtest");
     readValue(backtest, "entry_end_time",
               config.backtest.entryEndTime, "backtest");
+    readValue(backtest, "synthesize_one_second_quotes",
+              config.backtest.synthesizeOneSecondQuotes, "backtest");
+    readValue(backtest, "synthetic_base_spread_percent",
+              config.backtest.syntheticBaseSpreadPercent, "backtest");
+    readValue(backtest, "synthetic_volatility_spread_factor",
+              config.backtest.syntheticVolatilitySpreadFactor, "backtest");
+    readValue(backtest, "synthetic_maximum_spread_percent",
+              config.backtest.syntheticMaximumSpreadPercent, "backtest");
 
     requireFinitePositive(config.selection.minPrice, "selection.min_price");
     requireFiniteNonnegative(
@@ -460,6 +522,20 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
     if (config.backtest.entryStartTime >= config.backtest.entryEndTime) {
         throw std::invalid_argument(
             "Backtest entry window must start before it ends");
+    }
+    requireFiniteNonnegative(
+        config.backtest.syntheticBaseSpreadPercent,
+        "backtest.synthetic_base_spread_percent");
+    requireFiniteNonnegative(
+        config.backtest.syntheticVolatilitySpreadFactor,
+        "backtest.synthetic_volatility_spread_factor");
+    requireFiniteNonnegative(
+        config.backtest.syntheticMaximumSpreadPercent,
+        "backtest.synthetic_maximum_spread_percent");
+    if (config.backtest.syntheticBaseSpreadPercent >
+        config.backtest.syntheticMaximumSpreadPercent) {
+        throw std::invalid_argument(
+            "Synthetic base spread must not exceed its maximum");
     }
 
     config.selection.allowShortSelling = config.allowShortSelling;
