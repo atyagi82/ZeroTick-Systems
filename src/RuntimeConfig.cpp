@@ -267,6 +267,8 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
         {"min_price", "require_nifty100", "min_relative_volume",
          "min_absolute_volume", "max_spread_percent", "min_depth_quantity",
          "min_price_change_percent", "max_price_change_percent",
+         "momentum_lookback_seconds", "trend_lookback_seconds",
+         "min_trend_change_percent",
          "min_intraday_range_percent", "volume_ewma_alpha",
          "summary_interval_seconds", "worker_count"},
         "selection");
@@ -283,6 +285,12 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
               config.selection.minDepthQuantity, "selection");
     readValue(selection, "min_price_change_percent",
               config.selection.minPriceChangePercent, "selection");
+    readUnsignedValue(selection, "momentum_lookback_seconds",
+                      config.selection.momentumLookbackSeconds, "selection");
+    readUnsignedValue(selection, "trend_lookback_seconds",
+                      config.selection.trendLookbackSeconds, "selection");
+    readValue(selection, "min_trend_change_percent",
+              config.selection.minTrendChangePercent, "selection");
     readValue(selection, "max_price_change_percent",
               config.selection.maxPriceChangePercent, "selection");
     readValue(selection, "min_intraday_range_percent",
@@ -305,7 +313,8 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
          "stop_percent", "require_volume_confirmation",
          "min_relative_volume", "indicative_entry_budget",
          "imbalance_level_weights", "entry_trigger_offset_ticks",
-         "entry_limit_offset_ticks", "worker_count"},
+         "entry_limit_offset_ticks", "required_confirmations",
+         "confirmation_interval_ms", "worker_count"},
         "decision");
     readValue(decision, "minimum_imbalance",
               config.decision.minimumImbalance, "decision");
@@ -352,6 +361,14 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
                       config.decision.entryTriggerOffsetTicks, "decision");
     readUnsignedValue(decision, "entry_limit_offset_ticks",
                       config.decision.entryLimitOffsetTicks, "decision");
+    readUnsignedValue(decision, "required_confirmations",
+                      config.decision.requiredConfirmations, "decision");
+    int confirmationIntervalMilliseconds =
+        static_cast<int>(config.decision.pollInterval.count());
+    readIntValue(decision, "confirmation_interval_ms",
+                 confirmationIntervalMilliseconds, "decision");
+    config.decision.pollInterval =
+        std::chrono::milliseconds(confirmationIntervalMilliseconds);
     readUnsignedValue(decision, "worker_count",
                       config.decision.workerCount, "decision");
 
@@ -359,7 +376,9 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
     rejectUnknownKeys(
         handling,
         {"poll_interval_ms", "entry_fill_timeout_seconds",
-         "exit_fill_timeout_seconds", "worker_count"},
+         "exit_fill_timeout_seconds", "max_holding_seconds",
+         "reversal_imbalance_threshold", "reversal_confirmations",
+         "worker_count"},
         "handling");
     int handlingPollMilliseconds =
         static_cast<int>(config.handling.pollInterval.count());
@@ -367,12 +386,20 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
         static_cast<int>(config.handling.entryFillTimeout.count());
     int exitTimeoutSeconds =
         static_cast<int>(config.handling.exitFillTimeout.count());
+    int maxHoldingSeconds =
+        static_cast<int>(config.handling.maxHoldingTime.count());
     readIntValue(handling, "poll_interval_ms",
                  handlingPollMilliseconds, "handling");
     readIntValue(handling, "entry_fill_timeout_seconds",
                  entryTimeoutSeconds, "handling");
     readIntValue(handling, "exit_fill_timeout_seconds",
                  exitTimeoutSeconds, "handling");
+    readIntValue(handling, "max_holding_seconds",
+                 maxHoldingSeconds, "handling");
+    readValue(handling, "reversal_imbalance_threshold",
+              config.handling.reversalImbalanceThreshold, "handling");
+    readUnsignedValue(handling, "reversal_confirmations",
+                      config.handling.reversalConfirmations, "handling");
     readUnsignedValue(handling, "worker_count",
                       config.handling.workerCount, "handling");
     config.handling.pollInterval =
@@ -381,6 +408,8 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
         std::chrono::seconds(entryTimeoutSeconds);
     config.handling.exitFillTimeout =
         std::chrono::seconds(exitTimeoutSeconds);
+    config.handling.maxHoldingTime =
+        std::chrono::seconds(maxHoldingSeconds);
 
     const Json& risk = objectSection(root, "risk");
     rejectUnknownKeys(
@@ -394,10 +423,14 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
     rejectUnknownKeys(
         backtest,
         {"initial_capital", "max_open_positions",
-         "entry_timeout_minutes", "entry_start_time", "entry_end_time",
+         "entry_timeout_minutes", "entry_timeout_seconds",
+         "entry_start_time", "entry_end_time",
          "synthesize_one_second_quotes", "synthetic_base_spread_percent",
          "synthetic_volatility_spread_factor",
-         "synthetic_maximum_spread_percent"},
+         "synthetic_maximum_spread_percent", "max_holding_seconds",
+         "brokerage_rate_percent", "brokerage_cap_per_order",
+         "stt_sell_rate_percent", "exchange_rate_percent",
+         "sebi_rate_percent", "stamp_buy_rate_percent", "gst_percent"},
         "backtest");
     readValue(backtest, "initial_capital",
               config.backtest.initialCapital, "backtest");
@@ -405,6 +438,8 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
                       config.backtest.maxOpenPositions, "backtest");
     readIntValue(backtest, "entry_timeout_minutes",
                  config.backtest.entryTimeoutMinutes, "backtest");
+    readIntValue(backtest, "entry_timeout_seconds",
+                 config.backtest.entryTimeoutSeconds, "backtest");
     readValue(backtest, "entry_start_time",
               config.backtest.entryStartTime, "backtest");
     readValue(backtest, "entry_end_time",
@@ -417,6 +452,22 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
               config.backtest.syntheticVolatilitySpreadFactor, "backtest");
     readValue(backtest, "synthetic_maximum_spread_percent",
               config.backtest.syntheticMaximumSpreadPercent, "backtest");
+    readIntValue(backtest, "max_holding_seconds",
+                 config.backtest.maxHoldingSeconds, "backtest");
+    readValue(backtest, "brokerage_rate_percent",
+              config.backtest.brokerageRatePercent, "backtest");
+    readValue(backtest, "brokerage_cap_per_order",
+              config.backtest.brokerageCapPerOrder, "backtest");
+    readValue(backtest, "stt_sell_rate_percent",
+              config.backtest.sellSideSttPercent, "backtest");
+    readValue(backtest, "exchange_rate_percent",
+              config.backtest.transactionChargePercent, "backtest");
+    readValue(backtest, "sebi_rate_percent",
+              config.backtest.sebiChargePercent, "backtest");
+    readValue(backtest, "stamp_buy_rate_percent",
+              config.backtest.buySideStampPercent, "backtest");
+    readValue(backtest, "gst_percent",
+              config.backtest.gstPercent, "backtest");
 
     requireFinitePositive(config.selection.minPrice, "selection.min_price");
     requireFiniteNonnegative(
@@ -431,6 +482,9 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
     requireFiniteNonnegative(
         config.selection.minPriceChangePercent,
         "selection.min_price_change_percent");
+    requireFiniteNonnegative(
+        config.selection.minTrendChangePercent,
+        "selection.min_trend_change_percent");
     requireFinitePositive(
         config.selection.maxPriceChangePercent,
         "selection.max_price_change_percent");
@@ -441,6 +495,13 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
         config.selection.maxPriceChangePercent) {
         throw std::invalid_argument(
             "Selection minimum price change exceeds its maximum");
+    }
+    if (config.selection.trendLookbackSeconds > 0 &&
+        config.selection.momentumLookbackSeconds > 0 &&
+        config.selection.trendLookbackSeconds <=
+            config.selection.momentumLookbackSeconds) {
+        throw std::invalid_argument(
+            "Selection trend lookback must exceed momentum lookback");
     }
     if (selectionSummarySeconds <= 0 ||
         config.selection.workerCount == 0) {
@@ -481,7 +542,9 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
         config.decision.stopPercent >= 100.0 ||
         config.decision.minimumImbalance > 1.0 ||
         totalImbalanceWeight <= 0.0 ||
-        config.decision.workerCount == 0) {
+        config.decision.workerCount == 0 ||
+        config.decision.requiredConfirmations == 0 ||
+        confirmationIntervalMilliseconds <= 0) {
         throw std::invalid_argument(
             "Decision thresholds, weights, interval, or worker count are invalid");
     }
@@ -489,9 +552,18 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
     if (handlingPollMilliseconds <= 0 ||
         entryTimeoutSeconds <= 0 ||
         exitTimeoutSeconds <= 0 ||
+        maxHoldingSeconds < 0 ||
+        config.handling.reversalConfirmations == 0 ||
         config.handling.workerCount == 0) {
         throw std::invalid_argument(
             "Handling intervals, timeouts, and worker count must be positive");
+    }
+    requireFiniteNonnegative(
+        config.handling.reversalImbalanceThreshold,
+        "handling.reversal_imbalance_threshold");
+    if (config.handling.reversalImbalanceThreshold > 1.0) {
+        throw std::invalid_argument(
+            "handling.reversal_imbalance_threshold must not exceed 1");
     }
     if (config.maxOpenPositions == 0) {
         throw std::invalid_argument(
@@ -511,9 +583,10 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
         throw std::invalid_argument(
             "backtest.max_open_positions must be positive");
     }
-    if (config.backtest.entryTimeoutMinutes <= 0) {
+    if (config.backtest.entryTimeoutMinutes <= 0 ||
+        config.backtest.entryTimeoutSeconds < 0) {
         throw std::invalid_argument(
-            "backtest.entry_timeout_minutes must be positive");
+            "Backtest entry timeout values are invalid");
     }
     validateClockTime(
         config.backtest.entryStartTime, "backtest.entry_start_time");
@@ -537,6 +610,30 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
         throw std::invalid_argument(
             "Synthetic base spread must not exceed its maximum");
     }
+    if (config.backtest.maxHoldingSeconds < 0) {
+        throw std::invalid_argument(
+            "backtest.max_holding_seconds must be nonnegative");
+    }
+    requireFiniteNonnegative(
+        config.backtest.brokerageRatePercent,
+        "backtest.brokerage_rate_percent");
+    requireFiniteNonnegative(
+        config.backtest.brokerageCapPerOrder,
+        "backtest.brokerage_cap_per_order");
+    requireFiniteNonnegative(
+        config.backtest.sellSideSttPercent,
+        "backtest.stt_sell_rate_percent");
+    requireFiniteNonnegative(
+        config.backtest.transactionChargePercent,
+        "backtest.exchange_rate_percent");
+    requireFiniteNonnegative(
+        config.backtest.sebiChargePercent,
+        "backtest.sebi_rate_percent");
+    requireFiniteNonnegative(
+        config.backtest.buySideStampPercent,
+        "backtest.stamp_buy_rate_percent");
+    requireFiniteNonnegative(
+        config.backtest.gstPercent, "backtest.gst_percent");
 
     config.selection.allowShortSelling = config.allowShortSelling;
     config.selection.maxQuoteAge = std::chrono::seconds(quoteMaxAgeSeconds);
@@ -546,7 +643,12 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
     config.handling.allowShortSelling = config.allowShortSelling;
     config.handling.maxQuoteAge = std::chrono::seconds(quoteMaxAgeSeconds);
     config.handling.paperTradingCash = config.paperTradingCash;
+    config.handling.imbalanceLevelWeights =
+        config.decision.imbalanceLevelWeights;
     config.backtest.fallbackTickSize = config.fallbackTickSize;
+    if (config.backtest.maxHoldingSeconds == 0) {
+        config.backtest.maxHoldingSeconds = maxHoldingSeconds;
+    }
     config.backtest.selection = config.selection;
     config.backtest.decision = config.decision;
     return config;

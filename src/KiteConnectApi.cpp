@@ -767,6 +767,7 @@ MarketSnapshot parseQuote(
     // volatility / intraday-range checks). Kite returns these when present;
     // they default to zero otherwise.
     snapshot.volume = quote.value("volume", std::uint64_t(0));
+    snapshot.averagePrice = quote.value("average_price", 0.0);
     const json& ohlc = quote.value("ohlc", json::object());
     snapshot.openPrice = ohlc.value("open", 0.0);
     snapshot.highPrice = ohlc.value("high", 0.0);

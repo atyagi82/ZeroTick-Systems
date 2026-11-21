@@ -48,6 +48,7 @@ Json snapshotFields(const MarketSnapshot& snapshot) {
         {"bid_price", snapshot.bidPrice}, {"ask_price", snapshot.askPrice},
         {"bid_quantity", snapshot.bidQuantity},
         {"ask_quantity", snapshot.askQuantity}, {"volume", snapshot.volume},
+        {"average_price", snapshot.averagePrice},
         {"open", snapshot.openPrice}, {"high", snapshot.highPrice},
         {"low", snapshot.lowPrice}, {"sequence", snapshot.sequence},
         {"bid_levels", bookLevels(snapshot.bidLevels)},
@@ -109,6 +110,7 @@ std::string StructuredEventWriter::recordSelection(
         {"features", {{"side", sideName(candidate.side)},
                       {"relative_volume", candidate.relativeVolume},
                       {"price_change_percent", candidate.priceChangePercent},
+                      {"trend_change_percent", candidate.trendChangePercent},
                       {"spread_percent", candidate.spreadPercent},
                       {"intraday_range_percent", candidate.intradayRangePercent},
                       {"in_nifty_100", candidate.inNifty100}}}
@@ -131,6 +133,7 @@ std::string StructuredEventWriter::recordDecision(
         {"candidate_features", {{"side", sideName(candidate.side)},
                                 {"relative_volume", candidate.relativeVolume},
                                 {"price_change_percent", candidate.priceChangePercent},
+                                {"trend_change_percent", candidate.trendChangePercent},
                                 {"spread_percent", candidate.spreadPercent},
                                 {"intraday_range_percent", candidate.intradayRangePercent}}}
     };
