@@ -6,6 +6,7 @@
 #include "zerotick/StockSelectionEngine.h"
 #include "zerotick/TradingDecisionEngine.h"
 #include "zerotick/TradeHandlingEngine.h"
+#include "zerotick/StructuredEventWriter.h"
 
 #include <algorithm>
 #include <atomic>
@@ -18,6 +19,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -37,7 +39,8 @@ void refreshQuotesInChunks(zerotick::KiteApi& api,
                            const std::vector<std::string>& symbols,
                            std::size_t chunkSize,
                            zerotick::ThreadSafeQueue<
-                               zerotick::MarketSnapshot>& quoteUpdates) {
+                               zerotick::MarketSnapshot>& quoteUpdates,
+                           zerotick::StructuredEventWriter* eventWriter = nullptr) {
     for (std::size_t index = 0; index < symbols.size(); index += chunkSize) {
         std::vector<std::string> chunk;
         chunk.reserve(chunkSize);
@@ -48,6 +51,9 @@ void refreshQuotesInChunks(zerotick::KiteApi& api,
         const std::vector<zerotick::MarketSnapshot> refreshed =
             api.refreshQuotes(chunk);
         for (const zerotick::MarketSnapshot& snapshot : refreshed) {
+            if (eventWriter) {
+                eventWriter->recordSnapshot(snapshot);
+            }
             quoteUpdates.push(snapshot);
         }
     }
@@ -634,6 +640,7 @@ int main(int argumentCount, char* arguments[]) {
         zerotick::logLine("[app] startup");
         bool forceLogin = false;
         bool liveTrading = false;
+        bool shadowLive = false;
         bool shortSelling = false;
         bool backtest = false;
         bool optimize100Days = false;
@@ -641,6 +648,7 @@ int main(int argumentCount, char* arguments[]) {
         bool configPathProvided = false;
         std::string backtestDate;
         std::string configPath = "config.json";
+        std::string dataOutputPath = "shadow_live_events.jsonl";
         double requestedCapital = 0.0;
         for (int index = 1; index < argumentCount; ++index) {
             std::string argument(arguments[index]);
@@ -648,6 +656,14 @@ int main(int argumentCount, char* arguments[]) {
                 forceLogin = true;
             } else if (argument == "--enable-live-trading") {
                 liveTrading = true;
+            } else if (argument == "--shadow-live") {
+                shadowLive = true;
+            } else if (argument == "--data-output") {
+                if (index + 1 >= argumentCount) {
+                    throw std::invalid_argument(
+                        "--data-output requires one JSONL file path");
+                }
+                dataOutputPath = arguments[++index];
             } else if (argument == "--enable-shorts") {
                 shortSelling = true;
             } else if (argument == "--config") {
@@ -702,6 +718,14 @@ int main(int argumentCount, char* arguments[]) {
                 "Historical analysis cannot be combined with "
                 "--enable-live-trading");
         }
+        if (shadowLive && liveTrading) {
+            throw std::invalid_argument(
+                "--shadow-live cannot be combined with --enable-live-trading");
+        }
+        if ((backtest || optimize100Days) && shadowLive) {
+            throw std::invalid_argument(
+                "Historical analysis cannot be combined with --shadow-live");
+        }
         if (!backtest && !optimize100Days && capitalProvided) {
             throw std::invalid_argument(
                 "--capital can only be used with historical analysis");
@@ -718,6 +742,7 @@ int main(int argumentCount, char* arguments[]) {
         runtimeConfig.decision.allowShortSelling = allowShortSelling;
         runtimeConfig.handling.allowShortSelling = allowShortSelling;
         runtimeConfig.handling.liveTrading = liveTrading;
+        runtimeConfig.handling.shadowLiveSimulation = shadowLive;
         runtimeConfig.backtest.selection = runtimeConfig.selection;
         runtimeConfig.backtest.decision = runtimeConfig.decision;
         zerotick::logLine(
@@ -728,6 +753,15 @@ int main(int argumentCount, char* arguments[]) {
             std::to_string(runtimeConfig.maxOpenPositions));
 
         zerotick::KiteConnectApi kiteApi(forceLogin);
+
+        std::unique_ptr<zerotick::StructuredEventWriter> eventWriter;
+        if (shadowLive) {
+            eventWriter.reset(
+                new zerotick::StructuredEventWriter(dataOutputPath));
+            eventWriter->recordSession("shadow_live");
+            zerotick::logLine(
+                "[shadow] structured_output=" + dataOutputPath);
+        }
 
         zerotick::NiftyUniverse universe;
         if (optimize100Days) {
@@ -757,9 +791,10 @@ int main(int argumentCount, char* arguments[]) {
 
         std::vector<std::string> symbols = universe.symbols();
         zerotick::ThreadSafeQueue<zerotick::MarketSnapshot> quoteUpdates;
-        refreshQuotesInChunks(kiteApi, symbols, 40, quoteUpdates);
+        refreshQuotesInChunks(
+            kiteApi, symbols, 40, quoteUpdates, eventWriter.get());
 
-        double totalAvailableCash = 0.0;
+        double totalAvailableCash = runtimeConfig.paperTradingCash;
         if (liveTrading) {
             kiteApi.ensureNoOpenMisExposure(symbols);
             totalAvailableCash = kiteApi.cashAvailability().freeCash;
@@ -782,13 +817,13 @@ int main(int argumentCount, char* arguments[]) {
 
         zerotick::StockSelectionEngine selectionEngine(
             quoteUpdates, registry, selectionToDecision, universe,
-            runtimeConfig.selection);
+            runtimeConfig.selection, eventWriter.get());
         zerotick::TradingDecisionEngine decisionEngine(
             kiteApi, registry, selectionToDecision, decisionToHandling,
-            runtimeConfig.decision);
+            runtimeConfig.decision, eventWriter.get());
         zerotick::TradeHandlingEngine handlingEngine(
             kiteApi, registry, decisionToHandling, portfolioRisk,
-            runtimeConfig.handling);
+            runtimeConfig.handling, eventWriter.get());
 
         selectionEngine.start();
         decisionEngine.start();
@@ -803,7 +838,9 @@ int main(int argumentCount, char* arguments[]) {
                 try {
                     // Only returned quote snapshots enter selection. The API
                     // cache remains available for the decision-stage recheck.
-                    refreshQuotesInChunks(kiteApi, symbols, 40, quoteUpdates);
+                    refreshQuotesInChunks(
+                        kiteApi, symbols, 40, quoteUpdates,
+                        eventWriter.get());
                 } catch (const std::exception& exception) {
                     zerotick::logLine(
                         std::string("[kite] quote_batch=failed reason=\"") +
@@ -812,11 +849,20 @@ int main(int argumentCount, char* arguments[]) {
             }
         });
 
+        auto nextShadowStatus = std::chrono::steady_clock::now();
         while (!shutdownRequested.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (eventWriter &&
+                std::chrono::steady_clock::now() >= nextShadowStatus) {
+                std::cout << "\rShadow live | "
+                          << eventWriter->statusLine() << "          "
+                          << std::flush;
+                nextShadowStatus = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(2);
+            }
         }
 
-        std::cout << "Shutdown requested; stopping engines\n";
+        std::cout << "\nShutdown requested; stopping engines\n";
         quotePoller.join();
         selectionEngine.stop();
         decisionEngine.stop();

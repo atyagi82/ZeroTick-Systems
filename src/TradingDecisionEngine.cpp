@@ -1,5 +1,6 @@
 #include "zerotick/TradingDecisionEngine.h"
 #include "zerotick/Log.h"
+#include "zerotick/StructuredEventWriter.h"
 
 #include <cmath>
 #include <limits>
@@ -27,9 +28,9 @@ TradingDecisionEngine::TradingDecisionEngine(
     KiteApi& api, StockEngineRegistry& registry,
     ThreadSafeQueue<StockCandidate>& inputQueue,
     ThreadSafeQueue<TradeSignal>& outputQueue,
-    const DecisionConfig& config)
+    const DecisionConfig& config, StructuredEventWriter* eventWriter)
     : api_(api), registry_(registry), inputQueue_(inputQueue),
-      outputQueue_(outputQueue), config_(config) {}
+      outputQueue_(outputQueue), config_(config), eventWriter_(eventWriter) {}
 
 TradingDecisionEngine::~TradingDecisionEngine() { stop(); }
 
@@ -87,7 +88,13 @@ void TradingDecisionEngine::workerLoop() {
         }
 
         TradeSignal signal;
-        if (evaluateDecision(candidate, fresh, signal)) {
+        std::string rejectionReason;
+        if (evaluateDecision(candidate, fresh, signal, rejectionReason)) {
+            signal.candidateId = candidate.candidateId;
+            if (eventWriter_) {
+                signal.signalId = eventWriter_->recordDecision(
+                    candidate, fresh, true, signal, "passed");
+            }
             // Keep Decision ownership until the handling engine claims the
             // signal off the output queue.
             outputQueue_.push(signal);
@@ -100,6 +107,10 @@ void TradingDecisionEngine::workerLoop() {
                 " stop=" + std::to_string(signal.stopLossPrice) +
                 " qty=" + std::to_string(signal.quantity));
         } else {
+            if (eventWriter_) {
+                eventWriter_->recordDecision(
+                    candidate, fresh, false, signal, rejectionReason);
+            }
             registry_.release(candidate.symbol, EngineId::Decision);
         }
     }
@@ -151,10 +162,11 @@ double priceTick(const MarketSnapshot& snapshot, double fallbackTickSize) {
 
 bool TradingDecisionEngine::evaluateDecision(
     const StockCandidate& candidate, const MarketSnapshot& fresh,
-    TradeSignal& signal) const {
+    TradeSignal& signal, std::string& rejectionReason) const {
     const std::string& symbol = candidate.symbol;
     if (candidate.side == PositionSide::Short &&
         !config_.allowShortSelling) {
+        rejectionReason = "short_selling_disabled";
         return false;
     }
 
@@ -166,12 +178,14 @@ bool TradingDecisionEngine::evaluateDecision(
             ? (fresh.askPrice - fresh.bidPrice) / mid * 100.0
             : 0.0;
     if (spreadPercent > config_.maximumSpreadPercent) {
+        rejectionReason = "spread";
         return false;
     }
 
     // Volume confirmation carried from selection.
     if (config_.requireVolumeConfirmation &&
         candidate.relativeVolume < config_.minRelativeVolume) {
+        rejectionReason = "relative_volume";
         return false;
     }
 
@@ -181,6 +195,7 @@ bool TradingDecisionEngine::evaluateDecision(
          imbalance < config_.minimumImbalance) ||
         (candidate.side == PositionSide::Short &&
          imbalance > -config_.minimumImbalance)) {
+        rejectionReason = "order_book_imbalance";
         return false;
     }
 
@@ -190,6 +205,7 @@ bool TradingDecisionEngine::evaluateDecision(
           fresh.lastPrice < candidate.lastPrice) ||
          (candidate.side == PositionSide::Short &&
           fresh.lastPrice > candidate.lastPrice))) {
+        rejectionReason = "price_reversal";
         return false;
     }
 

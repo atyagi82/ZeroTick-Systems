@@ -1,5 +1,6 @@
 #include "zerotick/TradeHandlingEngine.h"
 #include "zerotick/Log.h"
+#include "zerotick/StructuredEventWriter.h"
 
 #include <cmath>
 #include <iomanip>
@@ -22,9 +23,11 @@ const char* sideName(PositionSide side) {
 TradeHandlingEngine::TradeHandlingEngine(
     KiteApi& api, StockEngineRegistry& registry,
     ThreadSafeQueue<TradeSignal>& inputQueue,
-    PortfolioRiskManager& portfolioRisk, const HandlingConfig& config)
+    PortfolioRiskManager& portfolioRisk, const HandlingConfig& config,
+    StructuredEventWriter* eventWriter)
     : api_(api), registry_(registry), inputQueue_(inputQueue),
-      portfolioRisk_(portfolioRisk), config_(config) {}
+      portfolioRisk_(portfolioRisk), config_(config),
+      eventWriter_(eventWriter) {}
 
 TradeHandlingEngine::~TradeHandlingEngine() { stop(); }
 
@@ -42,7 +45,97 @@ void TradeHandlingEngine::start() {
     zerotick::logLine("[handling] started " +
                       std::to_string(config_.workerCount) +
                       " worker threads; live_trading=" +
-                      (config_.liveTrading ? "enabled" : "disabled"));
+                      (config_.liveTrading ? "enabled" : "disabled") +
+                      " shadow_live=" +
+                      (config_.shadowLiveSimulation ? "enabled" : "disabled"));
+}
+
+bool TradeHandlingEngine::waitForShadowEntry(
+    const TradeSignal& signal, int quantity, double& entryPrice) {
+    if (eventWriter_) {
+        eventWriter_->recordTradeEvent(
+            signal, "entry_pending", quantity, signal.entryLimitPrice,
+            "waiting_for_live_quote");
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + config_.entryFillTimeout;
+    while (!stopRequested_.load() &&
+           std::chrono::steady_clock::now() < deadline) {
+        try {
+            const MarketSnapshot snapshot =
+                api_.getQuote(signal.symbol, config_.maxQuoteAge);
+            const bool triggerReached = signal.side == PositionSide::Long
+                ? snapshot.lastPrice >= signal.entryTriggerPrice
+                : snapshot.lastPrice <= signal.entryTriggerPrice;
+            const double executablePrice = signal.side == PositionSide::Long
+                ? snapshot.askPrice : snapshot.bidPrice;
+            const bool withinLimit = executablePrice > 0.0 &&
+                (signal.side == PositionSide::Long
+                    ? executablePrice <= signal.entryLimitPrice
+                    : executablePrice >= signal.entryLimitPrice);
+            if (triggerReached && withinLimit) {
+                entryPrice = executablePrice;
+                if (eventWriter_) {
+                    eventWriter_->recordTradeEvent(
+                        signal, "entry_filled", quantity, entryPrice,
+                        "live_quote_crossed_trigger", &snapshot);
+                }
+                return true;
+            }
+        } catch (const std::exception&) {
+        }
+        std::this_thread::sleep_for(config_.pollInterval);
+    }
+    if (eventWriter_) {
+        eventWriter_->recordTradeEvent(
+            signal, "entry_expired", quantity, 0.0,
+            stopRequested_.load() ? "shutdown" : "entry_timeout");
+    }
+    return false;
+}
+
+void TradeHandlingEngine::manageShadowExit(
+    const TradeSignal& signal, int quantity, double entryPrice) {
+    while (!stopRequested_.load()) {
+        try {
+            const MarketSnapshot snapshot =
+                api_.getQuote(signal.symbol, config_.maxQuoteAge);
+            const bool stopTouched = signal.side == PositionSide::Long
+                ? snapshot.lastPrice <= signal.stopLossPrice
+                : snapshot.lastPrice >= signal.stopLossPrice;
+            const bool targetTouched = signal.side == PositionSide::Long
+                ? snapshot.lastPrice >= signal.targetPrice
+                : snapshot.lastPrice <= signal.targetPrice;
+            if (stopTouched || targetTouched) {
+                double exitPrice = signal.side == PositionSide::Long
+                    ? snapshot.bidPrice : snapshot.askPrice;
+                if (exitPrice <= 0.0) exitPrice = snapshot.lastPrice;
+                const std::string reason = stopTouched ? "stop_loss" : "target";
+                if (eventWriter_) {
+                    eventWriter_->recordTradeEvent(
+                        signal, "position_closed", quantity, exitPrice,
+                        reason, &snapshot);
+                }
+                zerotick::logLine(
+                    "[shadow] symbol=" + signal.symbol + " side=" +
+                    sideName(signal.side) + " qty=" +
+                    std::to_string(quantity) + " entry=" +
+                    std::to_string(entryPrice) + " exit=" +
+                    std::to_string(exitPrice) + " reason=" + reason);
+                portfolioRisk_.releaseSlot(signal.symbol);
+                registry_.release(signal.symbol, EngineId::Handling);
+                return;
+            }
+        } catch (const std::exception&) {
+        }
+        std::this_thread::sleep_for(config_.pollInterval);
+    }
+    if (eventWriter_) {
+        eventWriter_->recordTradeEvent(
+            signal, "position_interrupted", quantity, entryPrice, "shutdown");
+    }
+    portfolioRisk_.releaseSlot(signal.symbol);
+    registry_.release(signal.symbol, EngineId::Handling);
 }
 
 void TradeHandlingEngine::stop() {
@@ -252,6 +345,8 @@ void TradeHandlingEngine::handleSignal(const TradeSignal& signal) {
         zerotick::logLine(
             "[handling] symbol=" + symbol +
             " rejected=short_selling_disabled");
+        if (eventWriter_) eventWriter_->recordTradeEvent(
+            signal, "entry_rejected", 0, 0.0, "short_selling_disabled");
         registry_.release(symbol, EngineId::Handling);
         return;
     }
@@ -264,6 +359,8 @@ void TradeHandlingEngine::handleSignal(const TradeSignal& signal) {
         zerotick::logLine(
             "[handling] symbol=" + symbol +
             " rejected=portfolio_slot_unavailable");
+        if (eventWriter_) eventWriter_->recordTradeEvent(
+            signal, "entry_rejected", 0, 0.0, "portfolio_slot_unavailable");
         registry_.release(symbol, EngineId::Handling);
         return;
     }
@@ -277,6 +374,9 @@ void TradeHandlingEngine::handleSignal(const TradeSignal& signal) {
         zerotick::logLine(
             "[handling] symbol=" + symbol +
             " rejected=insufficient_budget_for_one_share");
+        if (eventWriter_) eventWriter_->recordTradeEvent(
+            signal, "entry_rejected", 0, 0.0,
+            "insufficient_budget_for_one_share");
         portfolioRisk_.releaseSlot(symbol);
         registry_.release(symbol, EngineId::Handling);
         return;
@@ -328,6 +428,14 @@ void TradeHandlingEngine::handleSignal(const TradeSignal& signal) {
         entryFilled = true;
         entryPrice = status.averagePrice;
         filledQuantity = status.filledQuantity;
+    } else if (config_.shadowLiveSimulation) {
+        if (!waitForShadowEntry(signal, quantity, entryPrice)) {
+            portfolioRisk_.releaseSlot(symbol);
+            registry_.release(symbol, EngineId::Handling);
+            return;
+        }
+        entryFilled = true;
+        filledQuantity = quantity;
     } else {
         entryFilled = true;
         entryPrice = signal.entryLimitPrice;
@@ -339,7 +447,11 @@ void TradeHandlingEngine::handleSignal(const TradeSignal& signal) {
             std::to_string(entryPrice));
     }
 
-    manageExit(signal, filledQuantity, entryPrice);
+    if (config_.shadowLiveSimulation) {
+        manageShadowExit(signal, filledQuantity, entryPrice);
+    } else {
+        manageExit(signal, filledQuantity, entryPrice);
+    }
 }
 
 } // namespace zerotick

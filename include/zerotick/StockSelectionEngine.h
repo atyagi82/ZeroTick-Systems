@@ -15,6 +15,8 @@
 
 namespace zerotick {
 
+class StructuredEventWriter;
+
 /**
  * StockSelectionEngine
  * --------------------
@@ -33,7 +35,8 @@ public:
                          StockEngineRegistry& registry,
                          ThreadSafeQueue<StockCandidate>& outputQueue,
                          const StockUniverse& universe,
-                         const SelectionConfig& config);
+                         const SelectionConfig& config,
+                         StructuredEventWriter* eventWriter = nullptr);
     ~StockSelectionEngine();
 
     StockSelectionEngine(const StockSelectionEngine&) = delete;
@@ -64,6 +67,7 @@ private:
     ThreadSafeQueue<StockCandidate>& outputQueue_;
     const StockUniverse& universe_;
     SelectionConfig config_;
+    StructuredEventWriter* eventWriter_ = nullptr;
     std::atomic_bool stopRequested_{false};
     std::vector<std::thread> threads_;
     mutable std::mutex staleQuoteMutex_;

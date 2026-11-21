@@ -14,6 +14,8 @@
 
 namespace zerotick {
 
+class StructuredEventWriter;
+
 /**
  * TradeHandlingEngine
  * -------------------
@@ -32,7 +34,8 @@ public:
     TradeHandlingEngine(KiteApi& api, StockEngineRegistry& registry,
                         ThreadSafeQueue<TradeSignal>& inputQueue,
                         PortfolioRiskManager& portfolioRisk,
-                        const HandlingConfig& config);
+                        const HandlingConfig& config,
+                        StructuredEventWriter* eventWriter = nullptr);
     ~TradeHandlingEngine();
 
     TradeHandlingEngine(const TradeHandlingEngine&) = delete;
@@ -48,6 +51,10 @@ private:
                           BrokerOrderStatus& status) const;
     void manageExit(const TradeSignal& signal, int quantity,
                     double entryPrice);
+    bool waitForShadowEntry(const TradeSignal& signal, int quantity,
+                            double& entryPrice);
+    void manageShadowExit(const TradeSignal& signal, int quantity,
+                          double entryPrice);
     bool waitForExitFill(const std::string& orderId,
                          BrokerOrderStatus& status) const;
     double roundUpToTick(double price, double tick) const;
@@ -57,6 +64,7 @@ private:
     ThreadSafeQueue<TradeSignal>& inputQueue_;
     PortfolioRiskManager& portfolioRisk_;
     HandlingConfig config_;
+    StructuredEventWriter* eventWriter_ = nullptr;
     std::atomic_bool stopRequested_{false};
     std::vector<std::thread> threads_;
 };

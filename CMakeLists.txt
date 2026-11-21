@@ -24,6 +24,7 @@ add_library(zerotick_core
     src/KiteConnectApi.cpp
     src/EngineTypes.cpp
     src/Log.cpp
+    src/StructuredEventWriter.cpp
     src/RuntimeConfig.cpp
     src/StockSelectionEngine.cpp
     src/TradingDecisionEngine.cpp
