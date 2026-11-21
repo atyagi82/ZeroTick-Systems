@@ -34,6 +34,10 @@ struct BacktestConfig {
     int entryTimeoutMinutes = 5;
     std::string entryStartTime = "12:00";
     std::string entryEndTime = "13:00";
+    bool synthesizeOneSecondQuotes = false;
+    double syntheticBaseSpreadPercent = 0.02;
+    double syntheticVolatilitySpreadFactor = 0.05;
+    double syntheticMaximumSpreadPercent = 0.20;
     SelectionConfig selection;
     DecisionConfig decision;
 };
@@ -44,6 +48,7 @@ struct BacktestResult {
     double grossProfitLoss = 0.0;
     double maxDrawdownPercent = 0.0;
     std::size_t candleCount = 0;
+    std::size_t replayEventCount = 0;
     std::size_t generatedSignals = 0;
     std::size_t filledEntries = 0;
     std::size_t unfilledEntries = 0;
@@ -54,10 +59,12 @@ struct BacktestResult {
 };
 
 /**
- * Replays minute OHLCV bars through the available strategy gates.
+ * Replays OHLCV bars through the available strategy gates. Configured runs
+ * can expand each minute into a deterministic virtual one-second stream.
  *
- * Historical candles do not contain order-book depth, so spread, displayed
- * depth, and weighted imbalance checks are explicitly not simulated.
+ * Historical candles do not contain order-book depth, so displayed depth and
+ * weighted imbalance checks are explicitly not simulated. A configurable
+ * volatility-based spread estimate can be applied to simulated fills.
  */
 class BacktestEngine {
 public:

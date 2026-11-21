@@ -115,14 +115,20 @@ void printBacktestSummary(
         result.grossProfitLoss / result.initialCapital * 100.0;
 
     const auto sessionTime = [](const std::string& timestamp) {
-        if (timestamp.size() >= 16 && timestamp[10] == 'T') {
-            return timestamp.substr(11, 5);
+        if (timestamp.size() >= 19 && timestamp[10] == 'T') {
+            return timestamp.substr(11, 8);
         }
         return timestamp;
     };
 
     std::cout << std::fixed << std::setprecision(2)
-              << "Backtest date: " << date << " (Kite 1-minute candles)\n"
+              << "Backtest date: " << date << " (Kite 1-minute source candles)\n"
+              << "Replay mode: "
+              << (config.synthesizeOneSecondQuotes
+                      ? "synthetic one-second"
+                      : "original one-minute")
+              << "; source candles: " << result.candleCount
+              << "; replay events: " << result.replayEventCount << "\n"
               << "New-entry window (NSE time): [" << config.entryStartTime
               << ", " << config.entryEndTime
               << "); open positions remain managed after the window.\n"
@@ -132,7 +138,7 @@ void printBacktestSummary(
                      static_cast<double>(config.maxOpenPositions)
               << "; pending-entry timeout: "
               << config.entryTimeoutMinutes << " minute(s)\n"
-              << "\nClosed trades (times shown as HH:MM):\n"
+              << "\nClosed trades (times shown as HH:MM:SS):\n"
               << std::left
               << std::setw(4) << "#"
               << std::setw(13) << "Symbol"
@@ -188,8 +194,8 @@ void printBacktestSummary(
               << ", winners: " << winningTrades
               << ", win rate: " << winRate << "%\n"
               << "Symbols without candle data: " << symbolsWithoutData << "\n"
-              << "Approximation: spread/depth/imbalance filters, fees, and "
-                 "slippage are not modeled.\n"
+              << "Approximation: spread is estimated; depth, imbalance, "
+                 "fees, and additional slippage are not modeled.\n"
               << "TOTAL PROFIT / LOSS: INR " << std::showpos
               << result.grossProfitLoss << std::noshowpos << '\n';
 }
@@ -638,106 +644,38 @@ int main(int argumentCount, char* arguments[]) {
     try {
         zerotick::initializeLogFile();
         zerotick::logLine("[app] startup");
-        bool forceLogin = false;
-        bool liveTrading = false;
-        bool shadowLive = false;
-        bool shortSelling = false;
-        bool backtest = false;
-        bool optimize100Days = false;
-        bool capitalProvided = false;
         bool configPathProvided = false;
-        std::string backtestDate;
         std::string configPath = "config.json";
-        std::string dataOutputPath = "shadow_live_events.jsonl";
-        double requestedCapital = 0.0;
         for (int index = 1; index < argumentCount; ++index) {
             std::string argument(arguments[index]);
-            if (argument == "--login") {
-                forceLogin = true;
-            } else if (argument == "--enable-live-trading") {
-                liveTrading = true;
-            } else if (argument == "--shadow-live") {
-                shadowLive = true;
-            } else if (argument == "--data-output") {
-                if (index + 1 >= argumentCount) {
-                    throw std::invalid_argument(
-                        "--data-output requires one JSONL file path");
-                }
-                dataOutputPath = arguments[++index];
-            } else if (argument == "--enable-shorts") {
-                shortSelling = true;
-            } else if (argument == "--config") {
+            if (argument == "--config") {
                 if (configPathProvided || index + 1 >= argumentCount) {
                     throw std::invalid_argument(
                         "--config requires one configuration file path");
                 }
                 configPath = arguments[++index];
                 configPathProvided = true;
-            } else if (argument == "--backtest") {
-                if (backtest || index + 1 >= argumentCount) {
-                    throw std::invalid_argument(
-                        "--backtest requires one YYYY-MM-DD date");
-                }
-                backtest = true;
-                backtestDate = arguments[++index];
-            } else if (argument == "--optimize-100-days") {
-                if (optimize100Days) {
-                    throw std::invalid_argument(
-                        "--optimize-100-days may only be specified once");
-                }
-                optimize100Days = true;
-            } else if (argument == "--capital") {
-                if (index + 1 >= argumentCount) {
-                    throw std::invalid_argument(
-                        "--capital requires a positive amount");
-                }
-                const std::string amount = arguments[++index];
-                std::size_t parsedLength = 0;
-                requestedCapital = std::stod(amount, &parsedLength);
-                if (parsedLength != amount.size() ||
-                    !std::isfinite(requestedCapital) ||
-                    requestedCapital <= 0.0) {
-                    throw std::invalid_argument(
-                        "--capital requires a positive numeric amount");
-                }
-                capitalProvided = true;
-            } else if (argument == "--output") {
-                throw std::invalid_argument(
-                    "--output is no longer supported; backtest trades are "
-                    "printed in a console table");
             } else {
-                throw std::invalid_argument("Unknown argument: " + argument);
+                throw std::invalid_argument(
+                    "Unknown argument: " + argument +
+                    ". Runtime options now belong in config.json");
             }
-        }
-        if (backtest && optimize100Days) {
-            throw std::invalid_argument(
-                "--backtest and --optimize-100-days cannot be combined");
-        }
-        if ((backtest || optimize100Days) && liveTrading) {
-            throw std::invalid_argument(
-                "Historical analysis cannot be combined with "
-                "--enable-live-trading");
-        }
-        if (shadowLive && liveTrading) {
-            throw std::invalid_argument(
-                "--shadow-live cannot be combined with --enable-live-trading");
-        }
-        if ((backtest || optimize100Days) && shadowLive) {
-            throw std::invalid_argument(
-                "Historical analysis cannot be combined with --shadow-live");
-        }
-        if (!backtest && !optimize100Days && capitalProvided) {
-            throw std::invalid_argument(
-                "--capital can only be used with historical analysis");
         }
 
         zerotick::RuntimeConfig runtimeConfig =
             zerotick::loadRuntimeConfig(configPath);
-        if (capitalProvided) {
-            runtimeConfig.backtest.initialCapital = requestedCapital;
-        }
-        const bool allowShortSelling =
-            runtimeConfig.allowShortSelling || shortSelling;
+        const bool liveTrading =
+            runtimeConfig.run.mode == zerotick::RunMode::Live;
+        const bool shadowLive =
+            runtimeConfig.run.mode == zerotick::RunMode::ShadowLive;
+        const bool backtest =
+            runtimeConfig.run.mode == zerotick::RunMode::Backtest;
+        const bool optimize100Days =
+            runtimeConfig.run.mode == zerotick::RunMode::Optimize100Days;
+        const bool forceLogin = runtimeConfig.run.forceLogin;
+        const std::string& backtestDate = runtimeConfig.run.backtestDate;
+        const std::string& dataOutputPath = runtimeConfig.run.dataOutputPath;
+        const bool allowShortSelling = runtimeConfig.allowShortSelling;
         runtimeConfig.selection.allowShortSelling = allowShortSelling;
         runtimeConfig.decision.allowShortSelling = allowShortSelling;
         runtimeConfig.handling.allowShortSelling = allowShortSelling;
@@ -747,6 +685,10 @@ int main(int argumentCount, char* arguments[]) {
         runtimeConfig.backtest.decision = runtimeConfig.decision;
         zerotick::logLine(
             "[config] loaded=" + configPath +
+            " mode=" +
+            (liveTrading ? "live" : shadowLive ? "shadow_live" :
+             backtest ? "backtest" : optimize100Days ?
+             "optimize_100_days" : "paper") +
             " short_selling=" +
             (allowShortSelling ? "enabled" : "disabled") +
             " max_positions=" +

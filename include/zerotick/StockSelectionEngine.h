@@ -50,8 +50,8 @@ private:
     bool evaluateSelection(const MarketSnapshot& snapshot,
                            StockCandidate& candidate,
                            std::string& rejectionReason) const;
-    double updateAverageVolume(const std::string& symbol,
-                               std::uint64_t volume) const;
+    double updateRelativeVolume(const std::string& symbol,
+                                std::uint64_t cumulativeVolume) const;
 
     // The receipt time lets parallel workers reject delayed events without
     // replacing a symbol's baseline with an older quote.
@@ -74,6 +74,7 @@ private:
     std::unordered_set<std::string> staleQuoteSymbols_;
     mutable std::mutex volumeMutex_;
     mutable std::unordered_map<std::string, double> averageVolume_;
+    mutable std::unordered_map<std::string, std::uint64_t> previousVolume_;
     mutable std::mutex priceMutex_;
     mutable std::unordered_map<std::string, PriceObservation> previousPrice_;
 };
