@@ -39,6 +39,7 @@ inline const char* engineIdToString(EngineId id) {
 
 /** A stock that passed selection and is offered to the trading decision engine. */
 struct StockCandidate {
+    std::string candidateId;
     std::string symbol;
     PositionSide side = PositionSide::Long;
     double lastPrice = 0.0;
@@ -55,6 +56,8 @@ struct StockCandidate {
 
 /** A trade decision handed to the trade handling engine for execution. */
 struct TradeSignal {
+    std::string candidateId;
+    std::string signalId;
     std::string symbol;
     PositionSide side = PositionSide::Long;
     int quantity = 0;
@@ -124,6 +127,7 @@ struct HandlingConfig {
     std::size_t workerCount = 4;
     double paperTradingCash = 100000.0;
     bool liveTrading = false;
+    bool shadowLiveSimulation = false;
     bool allowShortSelling = false;           // final live/paper execution guard
 };
 

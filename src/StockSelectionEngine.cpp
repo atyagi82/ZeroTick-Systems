@@ -1,5 +1,6 @@
 #include "zerotick/StockSelectionEngine.h"
 #include "zerotick/Log.h"
+#include "zerotick/StructuredEventWriter.h"
 
 #include <cmath>
 #include <iomanip>
@@ -12,9 +13,11 @@ StockSelectionEngine::StockSelectionEngine(
     ThreadSafeQueue<MarketSnapshot>& quoteUpdates,
     StockEngineRegistry& registry,
     ThreadSafeQueue<StockCandidate>& outputQueue,
-    const StockUniverse& universe, const SelectionConfig& config)
+    const StockUniverse& universe, const SelectionConfig& config,
+    StructuredEventWriter* eventWriter)
     : quoteUpdates_(quoteUpdates), registry_(registry),
-      outputQueue_(outputQueue), universe_(universe), config_(config) {}
+      outputQueue_(outputQueue), universe_(universe), config_(config),
+      eventWriter_(eventWriter) {}
 
 StockSelectionEngine::~StockSelectionEngine() { stop(); }
 
@@ -139,12 +142,20 @@ void StockSelectionEngine::workerLoop(std::size_t workerIndex) {
                 candidate.selectedAt = std::chrono::steady_clock::now();
                 std::string rejectionReason;
                 if (evaluateSelection(snapshot, candidate, rejectionReason)) {
+                    if (eventWriter_) {
+                        candidate.candidateId = eventWriter_->recordSelection(
+                            snapshot, candidate, true, "passed");
+                    }
                     ++selected;
                     selectedSymbols.push_back(symbol);
                     // Keep Selection ownership until the decision engine claims
                     // it off the output queue.
                     outputQueue_.push(candidate);
                 } else {
+                    if (eventWriter_) {
+                        eventWriter_->recordSelection(
+                            snapshot, candidate, false, rejectionReason);
+                    }
                     ++rejected[rejectionReason];
                     registry_.release(symbol, EngineId::Selection);
                 }

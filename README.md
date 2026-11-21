@@ -25,6 +25,47 @@ Live order mode is opt-in and sends real Kite orders. Do not use it until you ha
 .\build\Release\zerotick.exe --enable-live-trading
 ```
 
+## Shadow live simulation and structured data
+
+Shadow live mode runs the normal live quote, selection, decision, risk, entry,
+and exit pipeline without submitting broker orders. It waits for later live
+quotes to cross each stop-limit entry, target, or stop instead of using the
+instant-fill behavior of the lightweight paper mode:
+
+```powershell
+.\build\Release\zerotick.exe --shadow-live
+```
+
+Structured events are appended to `shadow_live_events.jsonl` by default. Use
+an alternate path when keeping separate sessions or experiments:
+
+```powershell
+.\build\Release\zerotick.exe --shadow-live --data-output .\data\session-01.jsonl
+```
+
+The output is JSON Lines: every line is an independent JSON object and is
+flushed immediately. Each object has `schema_version`, `session_id`,
+`event_id`, `event_type`, and `event_time_utc`. Candidate and signal IDs join
+events across pipeline stages. Event types include `session_started`,
+`market_snapshot`, `selection_decision`, `trade_decision`, `entry_pending`,
+`entry_filled`, `entry_expired`, `entry_rejected`, `position_closed`, and
+`position_interrupted`. Market events retain the five bid and ask levels,
+prices, displayed quantities, volume, and OHLC fields. Decision events retain
+the computed strategy features and planned entry, target, and stop values.
+
+The console updates a compact status line with snapshot, candidate, signal,
+pending-entry, open-position, and completed-trade counts. Press Ctrl+C for an
+orderly shutdown. Open simulated positions are recorded as
+`position_interrupted`; they are not invented as completed outcomes.
+
+Entry fills use the first fresh quote after the signal whose last price has
+crossed the trigger and whose executable ask (long) or bid (short) remains
+inside the limit. Entries expire after `handling.entry_fill_timeout_seconds`.
+Long exits use the bid and short exits use the ask after the live last price
+reaches the target or stop. This is a quote-driven simulation: it cannot prove
+queue position or that the displayed quantity would fill the complete order.
+`--shadow-live` and `--enable-live-trading` are mutually exclusive.
+
 To force a fresh Kite login and token exchange:
 
 ```powershell

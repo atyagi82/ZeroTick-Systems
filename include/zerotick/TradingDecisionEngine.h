@@ -12,6 +12,8 @@
 
 namespace zerotick {
 
+class StructuredEventWriter;
+
 /**
  * TradingDecisionEngine
  * ---------------------
@@ -28,7 +30,8 @@ public:
     TradingDecisionEngine(KiteApi& api, StockEngineRegistry& registry,
                           ThreadSafeQueue<StockCandidate>& inputQueue,
                           ThreadSafeQueue<TradeSignal>& outputQueue,
-                          const DecisionConfig& config);
+                          const DecisionConfig& config,
+                          StructuredEventWriter* eventWriter = nullptr);
     ~TradingDecisionEngine();
 
     TradingDecisionEngine(const TradingDecisionEngine&) = delete;
@@ -41,7 +44,8 @@ private:
     void workerLoop();
     bool evaluateDecision(const StockCandidate& candidate,
                           const MarketSnapshot& fresh,
-                          TradeSignal& signal) const;
+                          TradeSignal& signal,
+                          std::string& rejectionReason) const;
     double weightedImbalance(const MarketSnapshot& snapshot) const;
 
     KiteApi& api_;
@@ -49,6 +53,7 @@ private:
     ThreadSafeQueue<StockCandidate>& inputQueue_;
     ThreadSafeQueue<TradeSignal>& outputQueue_;
     DecisionConfig config_;
+    StructuredEventWriter* eventWriter_ = nullptr;
     std::atomic_bool stopRequested_{false};
     std::vector<std::thread> threads_;
 };
