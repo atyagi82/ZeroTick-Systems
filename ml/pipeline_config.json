@@ -1,0 +1,48 @@
+{
+  "input_globs": ["data/shadow/*.jsonl"],
+  "trading_config": "config.json",
+  "output_dir": "ml/artifacts/latest",
+  "minimum_sessions": 5,
+  "minimum_completed_trades": 100,
+  "validation_session_fraction": 0.2,
+  "test_session_fraction": 0.2,
+  "optuna_trials": 100,
+  "random_seed": 42,
+  "minimum_model_probability": 0.55,
+  "book_level_weights": [1.0, 0.8, 0.6, 0.4, 0.2],
+  "objective": {
+    "drawdown_penalty": 2.0,
+    "minimum_trades": 20,
+    "insufficient_trade_penalty": 5.0
+  },
+  "search_space": {
+    "selection.min_relative_volume": [1.0, 3.0],
+    "selection.max_spread_percent": [0.01, 0.1],
+    "selection.min_price_change_percent": [0.03, 0.3],
+    "selection.momentum_lookback_seconds": [10, 120],
+    "selection.trend_lookback_seconds": [60, 600],
+    "selection.min_trend_change_percent": [0.01, 0.2],
+    "decision.minimum_imbalance": [0.05, 0.6],
+    "decision.min_relative_volume": [1.0, 3.0],
+    "decision.target_percent": [0.1, 1.0],
+    "decision.stop_percent": [0.1, 0.75],
+    "decision.required_confirmations": [1, 10],
+    "handling.max_holding_seconds": [60, 3600],
+    "handling.reversal_imbalance_threshold": [0.1, 0.8],
+    "handling.reversal_confirmations": [1, 20],
+    "model.minimum_probability": [0.5, 0.8]
+  },
+  "xgboost": {
+    "n_estimators": 500,
+    "max_depth": 4,
+    "learning_rate": 0.03,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 5,
+    "reg_lambda": 2.0,
+    "objective": "binary:logistic",
+    "eval_metric": "logloss",
+    "tree_method": "hist",
+    "early_stopping_rounds": 40
+  }
+}

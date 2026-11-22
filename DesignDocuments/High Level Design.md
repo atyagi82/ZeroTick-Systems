@@ -305,7 +305,39 @@ Run from the repository root so `.env` can be loaded:
 Runtime behavior belongs in `config.json`; only `--config <path>` is accepted
 as a command-line override. Set `run.force_login` to force browser login.
 
-## 9. Current limitations
+## 9. Offline ML research pipeline
+
+Shadow-live JSONL is the source for a separate Python research subsystem. Its
+three stages are: causal replay of sampled five-level depth with Optuna
+strategy tuning; XGBoost meta-label training to accept or reject an existing
+directional candidate; and joint strategy/probability-threshold optimization.
+
+The subsystem is deliberately outside the execution process. It cannot submit
+orders or rewrite runtime configuration. Suggested configurations, models,
+chronological split metadata, metrics, and trial histories are emitted under
+`ml/artifacts/` for review. Training requires completed shadow trades, while
+replay requires timestamped `market_snapshot` events with five bid and ask
+levels. Train, validation, and final test sessions remain chronologically
+separated.
+
+## 10. Historical ML dataset and validation boundary
+
+`export_backtest_data` is a non-trading run mode that downloads the latest
+configured number of completed sessions and writes schema-v1 JSONL. Records
+are grouped by symbol/session and retain ordered one-minute OHLCV plus tick
+size. The older sessions are labeled `train`; the later sessions are labeled
+`validation` in the manifest and every record. Output is staged as `.partial`
+and published only after a completion marker.
+
+The historical Python workflow mirrors the three shadow research phases:
+candle-strategy Optuna tuning, XGBoost candidate-quality training, and
+model-assisted tuning. Development-fit and development-validation both come
+only from the first 100 sessions. The following 100 sessions remain outside
+all fitting and parameter selection and are evaluated once after freezing the
+result. Historical and shadow models are separate because candles cannot
+provide genuine depth imbalance, queue position, or observed spread.
+
+## 11. Current limitations
 
 - The NIFTY 100 membership is a checked-in snapshot sourced from the NSE list
   dated 2026-11-19; it does not refresh automatically on index rebalance.
@@ -321,6 +353,7 @@ as a command-line override. Set `run.force_login` to force browser login.
 - The previous per-symbol worker pipeline has been removed. The active runtime
   is the selection, decision, and handling pipeline described above.
 
-## 10. Related documents
+## 12. Related documents
 
 - [Low-Level Design](./Low%20Level%20Design.md)
+- [ML pipeline](../ml/README.md)

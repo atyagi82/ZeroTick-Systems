@@ -173,10 +173,11 @@ RunMode parseRunMode(const std::string& value) {
     if (value == "shadow_live") return RunMode::ShadowLive;
     if (value == "backtest") return RunMode::Backtest;
     if (value == "optimize_100_days") return RunMode::Optimize100Days;
+    if (value == "export_backtest_data") return RunMode::ExportBacktestData;
     if (value == "live") return RunMode::Live;
     throw std::invalid_argument(
         "run.mode must be paper, shadow_live, backtest, "
-        "optimize_100_days, or live");
+        "optimize_100_days, export_backtest_data, or live");
 }
 
 void validateBacktestDate(const std::string& value) {
@@ -220,7 +221,8 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
     rejectUnknownKeys(
         run,
         {"mode", "force_login", "live_trading_confirmed",
-         "backtest_date", "data_output_path"},
+         "backtest_date", "data_output_path", "historical_training_sessions",
+         "historical_validation_sessions"},
         "run");
     std::string runMode = "paper";
     readValue(run, "mode", runMode, "run");
@@ -230,6 +232,10 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
               config.run.liveTradingConfirmed, "run");
     readValue(run, "backtest_date", config.run.backtestDate, "run");
     readValue(run, "data_output_path", config.run.dataOutputPath, "run");
+    readUnsignedValue(run, "historical_training_sessions",
+                      config.run.historicalTrainingSessions, "run");
+    readUnsignedValue(run, "historical_validation_sessions",
+                      config.run.historicalValidationSessions, "run");
     if (config.run.mode == RunMode::Backtest) {
         validateBacktestDate(config.run.backtestDate);
     }
@@ -237,6 +243,12 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
         !config.run.liveTradingConfirmed) {
         throw std::invalid_argument(
             "run.live_trading_confirmed must be true for live mode");
+    }
+    if (config.run.mode == RunMode::ExportBacktestData &&
+        (config.run.historicalTrainingSessions == 0 ||
+         config.run.historicalValidationSessions == 0)) {
+        throw std::invalid_argument(
+            "Historical training and validation session counts must be positive");
     }
     if (config.run.dataOutputPath.empty()) {
         throw std::invalid_argument("run.data_output_path must not be empty");

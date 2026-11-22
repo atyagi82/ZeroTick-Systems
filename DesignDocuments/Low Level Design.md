@@ -310,8 +310,9 @@ emits periodic aggregate rejections. `Log.h` serializes concurrent messages.
 
 The executable normally takes no arguments. The only supported optional switch
 is `--config PATH`, which selects a different JSON file. Authentication policy,
-short selling, run mode (`paper`, `shadow_live`, `live`, `backtest`, or
-`optimize_100_days`), backtest date, and output path are configured in JSON.
+short selling, run mode (`paper`, `shadow_live`, `live`, `backtest`,
+`optimize_100_days`, or `export_backtest_data`), backtest date, historical
+session counts, and output path are configured in JSON.
 Actual order submission additionally requires both `run.mode = "live"` and
 `run.live_trading_confirmed = true`.
 
@@ -319,7 +320,50 @@ In `shadow_live`, snapshots, candidate decisions, simulated fills, exits, and
 session metadata are written as JSON Lines to `run.data_output_path`. This is a
 structured operational dataset and is not tied to a particular ML model.
 
-## 10. Validation
+## 10. Offline ML subsystem
+
+`ml/zerotick_ml` contains these components:
+
+| Module | Responsibility |
+|---|---|
+| `events.py` | Validate schema-v1 JSONL, parse UTC time, preserve sessions, and order events |
+| `features.py` | Build the stable model feature vector and weighted five-level imbalance |
+| `dataset.py` | Join decisions, fills, and closes by `signal_id`; estimate charges and labels |
+| `replay.py` | Causally replay sampled depth, pending entries, fills, exits, and risk slots |
+| `training.py` | Split by ordered session, train XGBoost, select a validation threshold, and report untouched-test metrics |
+| `optimization.py` | Run Optuna TPE for deterministic and model-assisted configuration searches |
+| `cli.py` | Expose validation and the three offline phases without runtime mutation |
+
+The feature contract is stored with each model and includes momentum, trend,
+relative volume, spread, depth imbalance, range position, normalized price
+distances, planned reward/risk, and time-of-day encoding. XGBoost predicts only
+candidate profitability; strategy logic remains responsible for LONG/SHORT
+direction. Charge-adjusted profitability is the binary label.
+
+Optimization writes a complete suggested configuration but never overwrites
+`config.json`. Phase 3 loads the trained model as a final replay veto and tunes
+its probability threshold together with strategy parameters. Raw data and
+generated artifacts are excluded from version control.
+
+### Historical dataset and ML path
+
+`RunMode::ExportBacktestData` uses `latestTradingSessions` to select a
+chronological window. `exportBacktestDataset` downloads weekly ranges per
+instrument, groups candles by selected session, and writes
+`historical_dataset_started`, `historical_symbol_session`, and
+`historical_dataset_completed` JSONL records. Runtime configuration supplies
+the training count, validation count, and output path. The PowerShell wrapper
+creates a temporary configuration and protects existing output.
+
+`backtest_pipeline.py` validates the completion marker and disjoint ordered
+splits, builds causal candle features, and creates forward barrier outcomes.
+Phase 1 searches candle filters and exits. Phase 2 trains XGBoost with a stable
+historical feature contract. Phase 3 searches the model probability gate with
+the strategy. Only the final frozen result is applied to the dataset records
+marked `validation`. No phase rewrites runtime configuration or submits an
+order.
+
+## 11. Validation
 
 Configure, build, and run tests:
 
@@ -335,6 +379,14 @@ generation, portfolio sizing/cash calculations, paper handling, and an
 end-to-end paper-mode pipeline. Backtest coverage includes synthesized replay,
 entry fills, target/stop exits, and charge accounting.
 
-## 11. Related documents
+Python pipeline tests, after installing `ml/requirements.txt`:
+
+```powershell
+$env:PYTHONPATH = "ml"
+python -m unittest discover -s ml\tests -v
+```
+
+## 12. Related documents
 
 - [High-Level Design](./High%20Level%20Design.md)
+- [ML pipeline](../ml/README.md)

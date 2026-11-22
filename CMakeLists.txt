@@ -34,7 +34,8 @@ add_library(zerotick_core
 target_include_directories(zerotick_core PUBLIC include)
 target_link_libraries(
     zerotick_core
-    PRIVATE nlohmann_json::nlohmann_json winhttp bcrypt ws2_32 shell32
+    PUBLIC nlohmann_json::nlohmann_json
+    PRIVATE winhttp bcrypt ws2_32 shell32
 )
 
 add_executable(zerotick src/main.cpp)
