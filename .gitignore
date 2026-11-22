@@ -12,3 +12,11 @@
 # Runtime diagnostic log
 logs.txt
 shadow_live_events.jsonl
+
+# Recorded market data and generated ML artifacts
+/data/shadow/
+/data/backtest/
+/ml/artifacts/
+/ml/.venv/
+__pycache__/
+*.pyc

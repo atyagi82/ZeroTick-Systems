@@ -211,6 +211,42 @@ entry/exit price, gross P&L, and exit reason. The summary includes return,
 drawdown, fills, and win rate. Candle replay cannot establish the live
 strategy's actual fills or profitability.
 
+## Shadow-depth ML research
+
+The optional Python subsystem under `ml/` implements three offline phases:
+Optuna strategy tuning over recorded five-level depth, XGBoost meta-label
+training for candidate acceptance, and model-assisted Optuna tuning. It reads
+schema-v1 shadow-live JSONL and writes reviewable artifacts without modifying
+`config.json` or enabling live orders.
+
+Use 64-bit Python 3.10–3.12 and see [ml/README.md](ml/README.md) for setup,
+data requirements, commands, artifacts, and validation limitations.
+
+## Historical backtest ML dataset
+
+The historical workflow mirrors the same three research phases without
+pretending that minute candles contain live depth. It exports the latest 200
+completed trading sessions as schema-v1 JSONL: the older 100 are permanently
+marked `train`, and the following 100 are marked `validation`. Each record
+contains one symbol/session and its ordered minute OHLCV candles.
+
+After building the Release binary, collect the data with:
+
+```powershell
+.\scripts\collect_backtest_ml_data.ps1 -ForceLogin
+```
+
+The script uses a temporary config and does not alter `config.json`.
+Collection is API-rate-limited and can take a long time. Then run:
+
+```powershell
+python ml\run_backtest_pipeline.py validate
+python ml\run_backtest_pipeline.py all
+```
+
+Optuna and XGBoost use only the first 100 sessions. The second 100-session
+period is scored once after all parameters and the model are frozen.
+
 ### Local Kite credentials
 
 Copy `.env.example` to `.env` and fill in the API key and secret locally. `.env` is excluded by `.gitignore`; never commit it or paste its contents into chat. When no access token is present, or when `run.force_login` is true, the app captures a fresh request token through the local browser callback, exchanges it, and stores the access token in `.env`. The request token is kept in memory only. Access tokens are sensitive; revoke/regenerate them when needed. Run the program from the repository root so it finds `.env`.

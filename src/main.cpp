@@ -8,13 +8,17 @@
 #include "zerotick/TradeHandlingEngine.h"
 #include "zerotick/StructuredEventWriter.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cmath>
 #include <ctime>
 #include <exception>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -274,7 +278,7 @@ std::vector<std::string> latestTradingSessions(
     std::set<std::string> sessions;
     std::string chunkEnd = latestCompletedDate();
     for (std::size_t chunk = 0;
-         chunk < 40 && sessions.size() < sessionCount;
+         chunk < 80 && sessions.size() < sessionCount;
          ++chunk) {
         const std::string chunkStart = addCalendarDays(chunkEnd, -6);
         if (chunk > 0) {
@@ -300,6 +304,138 @@ std::vector<std::string> latestTradingSessions(
     dates.erase(dates.begin(),
                 dates.begin() + (dates.size() - sessionCount));
     return dates;
+}
+
+void exportBacktestDataset(
+    const zerotick::KiteConnectApi& api,
+    const zerotick::NiftyUniverse& universe,
+    std::size_t trainingSessionCount,
+    std::size_t validationSessionCount,
+    const std::string& outputPath) {
+    using Json = nlohmann::json;
+    const std::size_t totalSessions =
+        trainingSessionCount + validationSessionCount;
+    const std::vector<std::string> sessions =
+        latestTradingSessions(api, universe, totalSessions);
+    const std::vector<std::string> symbols = universe.symbols();
+    if (outputPath.empty()) {
+        throw std::invalid_argument("run.data_output_path must not be empty");
+    }
+    {
+        std::ifstream existing(outputPath);
+        if (existing.good()) {
+            throw std::runtime_error(
+                "Refusing to overwrite existing dataset: " + outputPath);
+        }
+    }
+    const std::string partialPath = outputPath + ".partial";
+    {
+        std::ifstream existingPartial(partialPath);
+        if (existingPartial.good()) {
+            throw std::runtime_error(
+                "Remove or rename the incomplete dataset first: " + partialPath);
+        }
+    }
+    std::ofstream output(partialPath, std::ios::out | std::ios::binary);
+    if (!output) {
+        throw std::runtime_error("Unable to create dataset: " + partialPath);
+    }
+
+    const std::string datasetId =
+        "backtest_" + sessions.front() + "_" + sessions.back();
+    std::map<std::string, std::pair<std::string, std::size_t>> splitByDate;
+    for (std::size_t index = 0; index < sessions.size(); ++index) {
+        splitByDate[sessions[index]] = std::make_pair(
+            index < trainingSessionCount ? "train" : "validation",
+            index < trainingSessionCount ? index : index - trainingSessionCount);
+    }
+    output << Json({
+        {"schema_version", 1},
+        {"event_type", "historical_dataset_started"},
+        {"dataset_id", datasetId},
+        {"source_interval", "minute"},
+        {"training_sessions", std::vector<std::string>(
+            sessions.begin(), sessions.begin() + trainingSessionCount)},
+        {"validation_sessions", std::vector<std::string>(
+            sessions.begin() + trainingSessionCount, sessions.end())},
+        {"symbols", symbols}
+    }).dump() << '\n';
+
+    std::size_t exportedRecords = 0;
+    std::size_t exportedCandles = 0;
+    std::size_t requestCount = 0;
+    for (std::size_t symbolIndex = 0; symbolIndex < symbols.size(); ++symbolIndex) {
+        const std::string& symbol = symbols[symbolIndex];
+        const double tickSize = api.getInstrumentTickSize(symbol);
+        std::map<std::string, std::vector<zerotick::HistoricalCandle>> byDate;
+        std::string chunkStart = sessions.front();
+        while (chunkStart <= sessions.back()) {
+            // Kite permits up to 60 calendar days for minute history. Keep a
+            // small safety margin while avoiding thousands of weekly calls.
+            const std::string proposedEnd = addCalendarDays(chunkStart, 54);
+            const std::string chunkEnd =
+                proposedEnd < sessions.back() ? proposedEnd : sessions.back();
+            if (requestCount++ > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            }
+            const std::vector<zerotick::HistoricalCandle> candles =
+                api.getHistoricalCandles(symbol, chunkStart, chunkEnd);
+            for (const zerotick::HistoricalCandle& candle : candles) {
+                if (candle.timestamp.size() < 10) continue;
+                const std::string date = candle.timestamp.substr(0, 10);
+                if (splitByDate.count(date) != 0) byDate[date].push_back(candle);
+            }
+            chunkStart = addCalendarDays(chunkEnd, 1);
+        }
+
+        for (const std::string& date : sessions) {
+            const auto found = byDate.find(date);
+            if (found == byDate.end() || found->second.empty()) continue;
+            Json candleArray = Json::array();
+            for (const zerotick::HistoricalCandle& candle : found->second) {
+                candleArray.push_back({
+                    {"timestamp", candle.timestamp}, {"open", candle.open},
+                    {"high", candle.high}, {"low", candle.low},
+                    {"close", candle.close}, {"volume", candle.volume}
+                });
+            }
+            const auto& split = splitByDate.at(date);
+            output << Json({
+                {"schema_version", 1},
+                {"event_type", "historical_symbol_session"},
+                {"dataset_id", datasetId}, {"split", split.first},
+                {"session_index", split.second}, {"session_date", date},
+                {"symbol", symbol}, {"tick_size", tickSize},
+                {"candles", std::move(candleArray)}
+            }).dump() << '\n';
+            ++exportedRecords;
+            exportedCandles += found->second.size();
+        }
+        output.flush();
+        zerotick::logLine(
+            "[backtest-export] instruments_processed=" +
+            std::to_string(symbolIndex + 1) + "/" +
+            std::to_string(symbols.size()) + " records=" +
+            std::to_string(exportedRecords));
+    }
+    output << Json({
+        {"schema_version", 1},
+        {"event_type", "historical_dataset_completed"},
+        {"dataset_id", datasetId}, {"records", exportedRecords},
+        {"candles", exportedCandles}
+    }).dump() << '\n';
+    output.close();
+    if (!output) {
+        throw std::runtime_error("Failed while writing dataset: " + partialPath);
+    }
+    if (std::rename(partialPath.c_str(), outputPath.c_str()) != 0) {
+        throw std::runtime_error(
+            "Dataset is complete but could not be renamed from " + partialPath);
+    }
+    zerotick::logLine(
+        "[backtest-export] completed output=" + outputPath +
+        " records=" + std::to_string(exportedRecords) +
+        " candles=" + std::to_string(exportedCandles));
 }
 
 std::vector<OptimizationVariant> makeOptimizationVariants(
@@ -677,6 +813,8 @@ int main(int argumentCount, char* arguments[]) {
             runtimeConfig.run.mode == zerotick::RunMode::Backtest;
         const bool optimize100Days =
             runtimeConfig.run.mode == zerotick::RunMode::Optimize100Days;
+        const bool exportBacktestData =
+            runtimeConfig.run.mode == zerotick::RunMode::ExportBacktestData;
         const bool forceLogin = runtimeConfig.run.forceLogin;
         const std::string& backtestDate = runtimeConfig.run.backtestDate;
         const std::string& dataOutputPath = runtimeConfig.run.dataOutputPath;
@@ -693,7 +831,8 @@ int main(int argumentCount, char* arguments[]) {
             " mode=" +
             (liveTrading ? "live" : shadowLive ? "shadow_live" :
              backtest ? "backtest" : optimize100Days ?
-             "optimize_100_days" : "paper") +
+             "optimize_100_days" : exportBacktestData ?
+             "export_backtest_data" : "paper") +
             " short_selling=" +
             (allowShortSelling ? "enabled" : "disabled") +
             " max_positions=" +
@@ -713,6 +852,14 @@ int main(int argumentCount, char* arguments[]) {
         zerotick::NiftyUniverse universe;
         if (optimize100Days) {
             runOptimizationStudy(kiteApi, universe, runtimeConfig.backtest);
+            return 0;
+        }
+        if (exportBacktestData) {
+            exportBacktestDataset(
+                kiteApi, universe,
+                runtimeConfig.run.historicalTrainingSessions,
+                runtimeConfig.run.historicalValidationSessions,
+                dataOutputPath);
             return 0;
         }
         if (backtest) {

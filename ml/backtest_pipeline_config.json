@@ -1,0 +1,39 @@
+{
+  "input_globs": ["data/backtest/*.jsonl"],
+  "trading_config": "config.json",
+  "output_dir": "ml/artifacts/backtest",
+  "optuna_trials": 100,
+  "random_seed": 42,
+  "development_validation_sessions": 20,
+  "candidate_holding_minutes": 60,
+  "minimum_candidates": 500,
+  "minimum_model_probability": 0.55,
+  "objective": {
+    "drawdown_penalty": 2.0,
+    "minimum_trades": 100,
+    "insufficient_trade_penalty": 0.02
+  },
+  "search_space": {
+    "min_relative_volume": [1.0, 3.0],
+    "min_momentum_percent": [0.03, 0.30],
+    "min_trend_percent": [0.01, 0.20],
+    "min_intraday_range_percent": [0.20, 1.00],
+    "max_spread_percent": [0.01, 0.10],
+    "target_percent": [0.10, 1.00],
+    "stop_percent": [0.10, 0.75],
+    "model_minimum_probability": [0.50, 0.80]
+  },
+  "xgboost": {
+    "n_estimators": 500,
+    "max_depth": 4,
+    "learning_rate": 0.03,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 5,
+    "reg_lambda": 2.0,
+    "objective": "binary:logistic",
+    "eval_metric": "logloss",
+    "tree_method": "hist",
+    "early_stopping_rounds": 40
+  }
+}

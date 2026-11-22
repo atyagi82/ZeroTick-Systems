@@ -1,10 +1,12 @@
 {
   "run": {
-    "mode": "backtest",
-    "force_login": false,
+    "mode": "shadow_live",
+    "force_login": true,
     "live_trading_confirmed": false,
-    "backtest_date": "2026-11-18",
-    "data_output_path": "testing.txt"
+    "backtest_date": "2026-11-16",
+    "data_output_path": "data/shadow/2026-11-23.jsonl",
+    "historical_training_sessions": 100,
+    "historical_validation_sessions": 100
   },
   "allow_short_selling": true,
   "market_data": {
@@ -22,20 +24,20 @@
     "min_price_change_percent": 0.12,
     "momentum_lookback_seconds": 30,
     "trend_lookback_seconds": 120,
-    "min_trend_change_percent": 0.06,
+    "min_trend_change_percent": 0.04025433076061081,
     "max_price_change_percent": 6.0,
-    "min_intraday_range_percent": 0.3,
+    "min_intraday_range_percent":  0.2616378217653841,
     "volume_ewma_alpha": 0.2,
     "summary_interval_seconds": 5,
     "worker_count": 4
   },
   "decision": {
     "minimum_imbalance": 0.15,
-    "maximum_spread_percent": 0.03,
-    "target_percent": 0.50,
-    "stop_percent": 0.30,
+    "maximum_spread_percent": 0.06850451148644784,
+    "target_percent": 0.926641065134189,
+    "stop_percent":0.28958279740568404,
     "require_volume_confirmation": true,
-    "min_relative_volume": 1.5,
+    "min_relative_volume":  2.8672552873577155,
     "indicative_entry_budget": 50000.0,
     "imbalance_level_weights": [1.0, 0.8, 0.6, 0.4, 0.2],
     "entry_trigger_offset_ticks": 0,
