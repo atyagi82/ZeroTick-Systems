@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#08110f">
+  <title>ZeroTick System</title>
+  <meta name="description" content="ZeroTick research portal: architecture, source, and NIFTY 50 historical analytics.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <section id="login" class="login-shell">
+    <div class="login-grid"></div>
+    <form id="login-form" class="login-card" autocomplete="off">
+      <div class="brand-mark"><span></span><span></span><span></span></div>
+      <p class="eyebrow">ZEROTICK / RESEARCH TERMINAL</p>
+      <h1>System intelligence,<br>without the noise.</h1>
+      <p class="muted">A private-facing workspace for architecture, source exploration and historical market context.</p>
+      <label for="password">Access key</label>
+      <div class="password-row">
+        <input id="password" type="password" placeholder="Enter access key" autofocus>
+        <button type="submit">Enter terminal</button>
+      </div>
+      <p id="login-error" class="error" aria-live="polite"></p>
+      <p class="security-note">Presentation lock only. No trading credentials or live controls are exposed.</p>
+    </form>
+  </section>
+
+  <div id="portal" class="portal" hidden>
+    <aside class="sidebar">
+      <a class="identity" href="#overview" aria-label="ZeroTick home">
+        <div class="brand-mark"><span></span><span></span><span></span></div>
+        <div><strong>ZeroTick</strong><small>System Portal</small></div>
+      </a>
+      <nav>
+        <button class="nav-item active" data-view="overview"><i>01</i>Overview</button>
+        <button class="nav-item" data-view="markets"><i>02</i>Markets</button>
+        <button class="nav-item" data-view="source"><i>03</i>Source</button>
+        <button class="nav-item" data-view="design"><i>04</i>Design</button>
+      </nav>
+      <div class="side-foot">
+        <span class="status-dot"></span><span>Research environment</span>
+        <button id="lock">Lock</button>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <button id="menu" aria-label="Toggle navigation">☰</button>
+        <div><span class="crumb">ZEROTICK</span><span id="current-view"> / OVERVIEW</span></div>
+        <div class="market-state"><span></span> Historical dataset · 200 sessions</div>
+      </header>
+
+      <section id="view-overview" class="view active-view">
+        <div class="hero">
+          <div>
+            <p class="eyebrow">A HIGH-FIDELITY TRADING RESEARCH SYSTEM</p>
+            <h2>Observe. Test.<br><em>Decide deliberately.</em></h2>
+            <p>ZeroTick joins a deterministic C++ execution pipeline with structured shadow-market capture and offline ML research.</p>
+            <button class="primary-action" data-jump="markets">Explore market history</button>
+          </div>
+          <div class="pulse-card">
+            <div class="pulse-head"><span>SYSTEM MAP</span><span>v1</span></div>
+            <div class="flow-node"><b>01</b><div><strong>Market snapshots</strong><small>Quotes · depth · volume</small></div></div>
+            <div class="flow-line"></div>
+            <div class="flow-node"><b>02</b><div><strong>Selection & decision</strong><small>Momentum · trend · imbalance</small></div></div>
+            <div class="flow-line"></div>
+            <div class="flow-node"><b>03</b><div><strong>Risk & handling</strong><small>Slots · exits · structured events</small></div></div>
+          </div>
+        </div>
+        <div class="metric-strip">
+          <article><span>Historical candles</span><strong>7.32M</strong><small>One-minute source records</small></article>
+          <article><span>Research sessions</span><strong>200</strong><small>100 train · 100 validation</small></article>
+          <article><span>Tracked universe</span><strong>100</strong><small>Current NIFTY research set</small></article>
+          <article><span>Portal charts</span><strong>50</strong><small>Current NIFTY 50 members</small></article>
+        </div>
+        <div class="section-heading"><p class="eyebrow">CAPABILITIES</p><h3>One system, three evidence layers.</h3></div>
+        <div class="capability-grid">
+          <article><span>LIVE / SHADOW</span><h4>Market microstructure</h4><p>Five-level depth, spread and observable fills captured without placing broker orders.</p></article>
+          <article><span>BACKTEST</span><h4>Deterministic replay</h4><p>Minute candles expanded into reproducible one-second paths with costs and risk limits.</p></article>
+          <article><span>OFFLINE ML</span><h4>Model-assisted research</h4><p>Optuna parameter search and XGBoost candidate ranking with chronological validation.</p></article>
+        </div>
+      </section>
+
+      <section id="view-markets" class="view">
+        <div class="page-title"><div><p class="eyebrow">HISTORICAL ANALYTICS</p><h2>NIFTY 50 monitor</h2></div><p>Daily bars aggregated from the ZeroTick 200-session candle archive.</p></div>
+        <div class="market-toolbar">
+          <label>Instrument<select id="symbol-select"></select></label>
+          <div class="range-buttons"><button data-range="30">1M</button><button data-range="90">3M</button><button data-range="180">6M</button><button class="active" data-range="all">All</button></div>
+        </div>
+        <div class="quote-grid">
+          <article><span>Last close</span><strong id="last-close">—</strong><small id="last-date">—</small></article>
+          <article><span>Session move</span><strong id="daily-change">—</strong><small>Close to close</small></article>
+          <article><span>RSI · 14</span><strong id="rsi-value">—</strong><small id="rsi-state">Momentum</small></article>
+          <article><span>SMA · 20</span><strong id="sma-value">—</strong><small>Daily close</small></article>
+        </div>
+        <div class="chart-panel">
+          <div class="chart-title"><div><h3 id="chart-name">—</h3><p id="chart-sector">—</p></div><div class="legend"><span class="close-key">Close</span><span class="sma-key">SMA 20</span></div></div>
+          <canvas id="price-chart" height="360"></canvas>
+          <div class="rsi-label"><span>RSI 14</span><span>70 overbought · 30 oversold</span></div>
+          <canvas id="rsi-chart" height="130"></canvas>
+        </div>
+        <p class="disclaimer">Research visualization only. RSI and moving averages are descriptive indicators, not trade recommendations.</p>
+      </section>
+
+      <section id="view-source" class="view source-view">
+        <div class="page-title"><div><p class="eyebrow">CURATED REPOSITORY VIEW</p><h2>Source browser</h2></div><p>Read-only, allowlisted files. Secrets, raw data, logs and build artifacts are excluded.</p></div>
+        <div class="source-shell">
+          <aside class="file-panel"><input id="file-search" placeholder="Filter files"><div id="file-list"></div></aside>
+          <article class="code-panel"><header><span id="file-path">Select a file</span><button id="copy-code">Copy</button></header><pre><code id="code-content"></code></pre></article>
+        </div>
+      </section>
+
+      <section id="view-design" class="view design-view">
+        <div class="page-title"><div><p class="eyebrow">SYSTEM DOCUMENTATION</p><h2>Architecture & design</h2></div><p>High- and low-level design rendered from the repository documentation.</p></div>
+        <div class="doc-tabs"><button class="active" data-doc="DesignDocuments/High Level Design.md">High-level design</button><button data-doc="DesignDocuments/Low Level Design.md">Low-level design</button></div>
+        <article id="document" class="document"></article>
+      </section>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
