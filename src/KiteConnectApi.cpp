@@ -2,12 +2,22 @@
 #include "zerotick/Log.h"
 #include "zerotick/Risk.h"
 
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <shellapi.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <CommonCrypto/CommonDigest.h>
+#include <curl/curl.h>
+#endif
 #include <nlohmann/json.hpp>
 
 #include <chrono>
@@ -28,6 +38,7 @@ namespace {
 
 using nlohmann::json;
 
+#ifdef _WIN32
 const wchar_t* kKiteHost = L"api.kite.trade";
 
 class WinHttpHandle {
@@ -50,6 +61,12 @@ public:
 private:
     HINTERNET handle_;
 };
+#else
+using SOCKET = int;
+const int INVALID_SOCKET = -1;
+const int SOCKET_ERROR = -1;
+inline int closesocket(int socket) { return close(socket); }
+#endif
 
 std::string trim(const std::string& value) {
     const std::string::size_type first = value.find_first_not_of(" \t\r\n");
@@ -174,14 +191,18 @@ std::string urlEncode(const std::string& value) {
 class WinsockSession {
 public:
     WinsockSession() {
+#ifdef _WIN32
         WSADATA data;
         if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
             throw std::runtime_error("Unable to initialize Windows sockets");
         }
+#endif
     }
 
     ~WinsockSession() {
+#ifdef _WIN32
         WSACleanup();
+#endif
     }
 
     WinsockSession(const WinsockSession&) = delete;
@@ -333,9 +354,14 @@ std::string requestTokenFromBrowser(const std::string& apiKey) {
         "https://kite.zerodha.com/connect/login?v=3&api_key=" +
         urlEncode(apiKey);
     zerotick::logLine("[kite_auth] browser_login_started");
+#ifdef _WIN32
     const HINSTANCE browserResult = ShellExecuteA(
         nullptr, "open", loginUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    if (reinterpret_cast<INT_PTR>(browserResult) <= 32) {
+    const bool browserOpened = reinterpret_cast<INT_PTR>(browserResult) > 32;
+#else
+    const bool browserOpened = std::system(("open '" + loginUrl + "'").c_str()) == 0;
+#endif
+    if (!browserOpened) {
         zerotick::logLine(
             "[kite_auth] browser_launch_failed; login_url_printed_to_console");
         std::cout << "Could not open a browser automatically. Open this URL:\n"
@@ -351,7 +377,13 @@ std::string requestTokenFromBrowser(const std::string& apiKey) {
         FD_SET(listener.get(), &readable);
         timeval wait = {};
         wait.tv_sec = 1;
-        const int ready = select(0, &readable, nullptr, nullptr, &wait);
+        const int ready = select(
+#ifdef _WIN32
+            0,
+#else
+            listener.get() + 1,
+#endif
+            &readable, nullptr, nullptr, &wait);
         if (ready == SOCKET_ERROR) {
             throw std::runtime_error("Kite callback listener failed");
         }
@@ -360,7 +392,11 @@ std::string requestTokenFromBrowser(const std::string& apiKey) {
         }
 
         sockaddr_in peer = {};
+#ifdef _WIN32
         int peerSize = sizeof(peer);
+#else
+        socklen_t peerSize = sizeof(peer);
+#endif
         SocketHandle client(accept(
             listener.get(),
             reinterpret_cast<sockaddr*>(&peer),
@@ -368,6 +404,11 @@ std::string requestTokenFromBrowser(const std::string& apiKey) {
         if (client.get() == INVALID_SOCKET) {
             continue;
         }
+#ifndef _WIN32
+        const int noSigpipe = 1;
+        setsockopt(client.get(), SOL_SOCKET, SO_NOSIGPIPE,
+            &noSigpipe, sizeof(noSigpipe));
+#endif
         if ((ntohl(peer.sin_addr.s_addr) >> 24) != 127) {
             sendCallbackResponse(
                 client.get(), "403 Forbidden", "Local requests only.");
@@ -430,6 +471,7 @@ std::string requestTokenFromBrowser(const std::string& apiKey) {
 }
 
 std::string sha256(const std::string& value) {
+#ifdef _WIN32
     BCRYPT_ALG_HANDLE algorithm = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
     DWORD objectLength = 0;
@@ -486,6 +528,16 @@ std::string sha256(const std::string& value) {
         output << std::setw(2) << static_cast<unsigned int>(byte);
     }
     return output.str();
+#else
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(value.data(), static_cast<CC_LONG>(value.size()), digest);
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (unsigned char byte : digest) {
+        output << std::setw(2) << static_cast<unsigned int>(byte);
+    }
+    return output.str();
+#endif
 }
 
 std::wstring widenAscii(const std::string& value) {
@@ -536,9 +588,10 @@ std::string httpRequest(
     zerotick::logLine(
         "[kite_api] request_start operation=" + std::string(operation) +
         " method=" + requestMethod);
-    DWORD statusCode = 0;
+    long statusCode = 0;
     std::size_t responseBytes = 0;
     try {
+#ifdef _WIN32
     WinHttpHandle session(WinHttpOpen(
         L"ZeroTick-Systems/0.1",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -634,6 +687,71 @@ std::string httpRequest(
         response.append(buffer.data(), received);
     }
     responseBytes = response.size();
+#else
+    static const bool curlReady = [] {
+        return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+    }();
+    if (!curlReady) {
+        throw std::runtime_error("Unable to initialize Kite HTTP client");
+    }
+    CURL* curl = curl_easy_init();
+    if (curl == nullptr) {
+        throw std::runtime_error("Unable to initialize Kite HTTP request");
+    }
+    struct curl_slist* headers = nullptr;
+    std::string response;
+    const std::string url = "https://api.kite.trade" +
+        std::string(path.begin(), path.end());
+    const auto appendHeader = [&headers](const std::string& header) {
+        struct curl_slist* updated = curl_slist_append(headers, header.c_str());
+        if (updated == nullptr) {
+            throw std::runtime_error("Unable to allocate Kite HTTP header");
+        }
+        headers = updated;
+    };
+    try {
+        appendHeader("X-Kite-Version: 3");
+        if (!accessToken.empty()) {
+            appendHeader("Authorization: token " + apiKey + ":" + accessToken);
+        }
+        if (requestMethod == "POST") {
+            appendHeader(jsonBody
+                ? "Content-Type: application/json"
+                : "Content-Type: application/x-www-form-urlencoded");
+        }
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "ZeroTick-Systems/0.1");
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L);
+        curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "gzip");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+            +[](char* data, size_t size, size_t count, void* target) -> size_t {
+                const size_t bytes = size * count;
+                static_cast<std::string*>(target)->append(data, bytes);
+                return bytes;
+            });
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        if (requestMethod == "POST") {
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+        }
+        const CURLcode result = curl_easy_perform(curl);
+        if (result != CURLE_OK) {
+            throw std::runtime_error(
+                "Kite HTTP request failed: " + std::string(curl_easy_strerror(result)));
+        }
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
+        responseBytes = response.size();
+    } catch (...) {
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        throw;
+    }
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+#endif
 
     // Avoid echoing response bodies that may contain account/session details.
     if (statusCode < 200 || statusCode >= 300) {

@@ -250,7 +250,11 @@ std::string addCalendarDays(const std::string& date, int days) {
 std::string latestCompletedDate() {
     const std::time_t now = std::time(nullptr);
     std::tm local = {};
+#ifdef _WIN32
     if (localtime_s(&local, &now) != 0) {
+#else
+    if (localtime_r(&now, &local) == nullptr) {
+#endif
         throw std::runtime_error("Unable to read local date for backtest");
     }
 

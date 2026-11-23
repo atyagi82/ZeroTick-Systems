@@ -6,8 +6,12 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-if(NOT WIN32)
-    message(FATAL_ERROR "The initial Kite Connect transport currently targets Windows (WinHTTP).")
+if(NOT WIN32 AND NOT APPLE)
+    message(FATAL_ERROR "The Kite Connect transport supports Windows and macOS.")
+endif()
+
+if(APPLE)
+    find_package(CURL REQUIRED)
 endif()
 
 include(FetchContent)
@@ -35,8 +39,12 @@ target_include_directories(zerotick_core PUBLIC include)
 target_link_libraries(
     zerotick_core
     PUBLIC nlohmann_json::nlohmann_json
-    PRIVATE winhttp bcrypt ws2_32 shell32
 )
+if(WIN32)
+    target_link_libraries(zerotick_core PRIVATE winhttp bcrypt ws2_32 shell32)
+elseif(APPLE)
+    target_link_libraries(zerotick_core PRIVATE CURL::libcurl)
+endif()
 
 add_executable(zerotick src/main.cpp)
 target_link_libraries(zerotick PRIVATE zerotick_core)

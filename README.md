@@ -5,7 +5,7 @@
 
 ## Development setup
 
-The initial Kite transport uses Windows WinHTTP/CNG, so it currently builds on Windows with CMake and C++14 or newer. CMake downloads the header-only `nlohmann/json` dependency during configuration.
+The Kite transport builds on Windows and macOS with CMake and C++14 or newer. Windows uses WinHTTP/CNG; macOS uses the system libcurl and CommonCrypto libraries. CMake downloads the header-only `nlohmann/json` dependency during configuration.
 
 ```powershell
 cmake -S . -B build
@@ -18,6 +18,10 @@ Run the application with:
 ```powershell
 .\build\Release\zerotick.exe
 ```
+
+On macOS, run `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release`, then
+`cmake --build build --config Release`. Start the app from the repository root
+with `./build/zerotick` so it can find `config.json` and `.env`.
 
 Execution behavior is selected by `run.mode` in `config.json`. Supported modes
 are `paper`, `shadow_live`, `backtest`, `optimize_100_days`, and `live`. Live
