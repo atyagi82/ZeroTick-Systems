@@ -319,6 +319,10 @@ Actual order submission additionally requires both `run.mode = "live"` and
 In `shadow_live`, snapshots, candidate decisions, simulated fills, exits, and
 session metadata are written as JSON Lines to `run.data_output_path`. This is a
 structured operational dataset and is not tied to a particular ML model.
+`StructuredEventWriter` tracks bytes after every flushed record and rotates
+before the next complete record would cross `run.data_output_max_mb`. The base
+file is followed by `.part002`, `.part003`, and subsequent numbered parts. A
+record is never divided between files, and IDs remain continuous across parts.
 
 ## 10. Offline ML subsystem
 

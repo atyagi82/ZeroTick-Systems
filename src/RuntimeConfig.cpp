@@ -221,7 +221,8 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
     rejectUnknownKeys(
         run,
         {"mode", "force_login", "live_trading_confirmed",
-         "backtest_date", "data_output_path", "historical_training_sessions",
+         "backtest_date", "data_output_path", "data_output_max_mb",
+         "historical_training_sessions",
          "historical_validation_sessions"},
         "run");
     std::string runMode = "paper";
@@ -232,6 +233,8 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
               config.run.liveTradingConfirmed, "run");
     readValue(run, "backtest_date", config.run.backtestDate, "run");
     readValue(run, "data_output_path", config.run.dataOutputPath, "run");
+    readUnsignedValue(run, "data_output_max_mb",
+                      config.run.dataOutputMaxMb, "run");
     readUnsignedValue(run, "historical_training_sessions",
                       config.run.historicalTrainingSessions, "run");
     readUnsignedValue(run, "historical_validation_sessions",
@@ -252,6 +255,9 @@ RuntimeConfig parseRuntimeConfig(const std::string& contents) {
     }
     if (config.run.dataOutputPath.empty()) {
         throw std::invalid_argument("run.data_output_path must not be empty");
+    }
+    if (config.run.dataOutputMaxMb == 0) {
+        throw std::invalid_argument("run.data_output_max_mb must be positive");
     }
     readValue(root, "allow_short_selling", config.allowShortSelling, "root");
 

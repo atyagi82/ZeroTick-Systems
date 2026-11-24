@@ -842,11 +842,17 @@ int main(int argumentCount, char* arguments[]) {
 
         std::unique_ptr<zerotick::StructuredEventWriter> eventWriter;
         if (shadowLive) {
+            const std::uint64_t maxFileBytes =
+                static_cast<std::uint64_t>(runtimeConfig.run.dataOutputMaxMb) *
+                1024ULL * 1024ULL;
             eventWriter.reset(
-                new zerotick::StructuredEventWriter(dataOutputPath));
+                new zerotick::StructuredEventWriter(
+                    dataOutputPath, maxFileBytes));
             eventWriter->recordSession("shadow_live");
             zerotick::logLine(
-                "[shadow] structured_output=" + dataOutputPath);
+                "[shadow] structured_output=" + dataOutputPath +
+                " rotate_mb=" +
+                std::to_string(runtimeConfig.run.dataOutputMaxMb));
         }
 
         zerotick::NiftyUniverse universe;

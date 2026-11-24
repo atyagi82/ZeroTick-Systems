@@ -6,10 +6,12 @@
 #include "zerotick/Risk.h"
 #include "zerotick/RuntimeConfig.h"
 #include "zerotick/Log.h"
+#include "zerotick/StructuredEventWriter.h"
 
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <fstream>
 #include <stdexcept>
@@ -641,7 +643,9 @@ void testFreeCashSubtractsExistingUtilization() {
 
 void testRuntimeConfigLoadsAlgorithmParameters() {
     const zerotick::RuntimeConfig config = zerotick::parseRuntimeConfig(
-        R"({"allow_short_selling":true,"market_data":{"quote_poll_interval_ms":750,"quote_max_age_seconds":8,"fallback_tick_size":0.05},"selection":{"min_price":125.0,"volume_ewma_alpha":0.3,"worker_count":2},"decision":{"target_percent":0.3,"stop_percent":0.4,"indicative_entry_budget":25000.0,"imbalance_level_weights":[1.0,0.7,0.5,0.3,0.1],"entry_trigger_offset_ticks":2,"entry_limit_offset_ticks":3},"risk":{"max_open_positions":5,"paper_trading_cash":50000.0},"backtest":{"initial_capital":20000.0,"max_open_positions":3,"entry_timeout_minutes":7,"entry_start_time":"12:00","entry_end_time":"13:00"}})");
+        R"({"run":{"data_output_max_mb":64},"allow_short_selling":true,"market_data":{"quote_poll_interval_ms":750,"quote_max_age_seconds":8,"fallback_tick_size":0.05},"selection":{"min_price":125.0,"volume_ewma_alpha":0.3,"worker_count":2},"decision":{"target_percent":0.3,"stop_percent":0.4,"indicative_entry_budget":25000.0,"imbalance_level_weights":[1.0,0.7,0.5,0.3,0.1],"entry_trigger_offset_ticks":2,"entry_limit_offset_ticks":3},"risk":{"max_open_positions":5,"paper_trading_cash":50000.0},"backtest":{"initial_capital":20000.0,"max_open_positions":3,"entry_timeout_minutes":7,"entry_start_time":"12:00","entry_end_time":"13:00"}})");
+    require(config.run.dataOutputMaxMb == 64,
+            "structured output rotation size should load from configuration");
     require(config.allowShortSelling,
             "configuration should allow explicitly enabled short selling");
     require(config.selection.minPrice == 125.0 &&
@@ -676,6 +680,48 @@ void testRuntimeConfigLoadsAlgorithmParameters() {
     require(config.selection.allowShortSelling &&
                 config.decision.allowShortSelling,
             "short-selling setting should reach the engine configs");
+}
+
+void testStructuredEventWriterRotatesCompleteJsonLines() {
+    const std::string base = "structured_rotation_test.jsonl";
+    const std::string second = "structured_rotation_test.part002.jsonl";
+    const std::string third = "structured_rotation_test.part003.jsonl";
+    std::remove(base.c_str());
+    std::remove(second.c_str());
+    std::remove(third.c_str());
+    {
+        zerotick::StructuredEventWriter writer(base, 4000);
+        writer.recordSession("shadow_live");
+        zerotick::MarketSnapshot snapshot = makeQuote(
+            100.0, 100000, 5000, 5000, 99.0, 101.0, 98.0);
+        for (int index = 0; index < 10; ++index) {
+            snapshot.sequence = static_cast<std::uint64_t>(index);
+            writer.recordSnapshot(snapshot);
+        }
+    }
+    std::ifstream rotated(second, std::ios::in | std::ios::binary);
+    require(static_cast<bool>(rotated),
+            "structured writer should create a numbered second part");
+    std::size_t records = 0;
+    for (const std::string& path : {base, second, third}) {
+        std::ifstream input(path, std::ios::in | std::ios::binary);
+        if (!input) continue;
+        input.seekg(0, std::ios::end);
+        require(input.tellg() <= 4000,
+                "rotated structured files should respect their size limit");
+        input.seekg(0, std::ios::beg);
+        std::string line;
+        while (std::getline(input, line)) {
+            require(!line.empty() && line.front() == '{' && line.back() == '}',
+                    "rotation must preserve complete JSON records");
+            ++records;
+        }
+    }
+    require(records == 11,
+            "rotation should retain the session and every snapshot record");
+    std::remove(base.c_str());
+    std::remove(second.c_str());
+    std::remove(third.c_str());
 }
 
 void testRuntimeConfigRejectsUnknownAndInvalidValues() {
@@ -1122,6 +1168,7 @@ void testFullPipelinePaperMode() {
 int main() {
     try {
         testLogLinePersistsToLogsFile();
+        testStructuredEventWriterRotatesCompleteJsonLines();
         testNiftyUniverseUsesCurrentNifty100Symbols();
         testRegistryOneEngineAtATime();
         testSelectionSelectsGoodStock();

@@ -58,14 +58,62 @@ Json snapshotFields(const MarketSnapshot& snapshot) {
 
 } // namespace
 
-StructuredEventWriter::StructuredEventWriter(const std::string& path)
-    : output_(path, std::ios::out | std::ios::app) {
-    if (!output_) {
-        throw std::runtime_error("Unable to open structured event file: " + path);
-    }
+StructuredEventWriter::StructuredEventWriter(
+    const std::string& path, std::uint64_t maxFileBytes)
+    : basePath_(path), maxFileBytes_(maxFileBytes) {
+    openInitialPart();
     sessionId_ = "session-" + utcNow() + "-" + std::to_string(
         static_cast<unsigned long long>(
             std::chrono::steady_clock::now().time_since_epoch().count()));
+}
+
+std::string StructuredEventWriter::partPath(std::uint64_t part) const {
+    if (part <= 1) return basePath_;
+    const std::size_t separator = basePath_.find_last_of("/\\");
+    const std::size_t extension = basePath_.find_last_of('.');
+    const bool hasExtension = extension != std::string::npos &&
+        (separator == std::string::npos || extension > separator);
+    const std::string prefix = hasExtension
+        ? basePath_.substr(0, extension) : basePath_;
+    const std::string suffix = hasExtension
+        ? basePath_.substr(extension) : std::string();
+    std::ostringstream path;
+    path << prefix << ".part" << std::setw(3) << std::setfill('0')
+         << part << suffix;
+    return path.str();
+}
+
+void StructuredEventWriter::openInitialPart() {
+    currentPart_ = 1;
+    while (true) {
+        std::ifstream next(
+            partPath(currentPart_ + 1), std::ios::in | std::ios::binary);
+        if (!next) break;
+        ++currentPart_;
+    }
+    openPart(currentPart_);
+    if (maxFileBytes_ > 0 && currentBytes_ >= maxFileBytes_) {
+        openPart(currentPart_ + 1);
+    }
+}
+
+void StructuredEventWriter::openPart(std::uint64_t part) {
+    if (output_.is_open()) output_.close();
+    output_.clear();
+    currentPart_ = part;
+    const std::string path = partPath(currentPart_);
+    std::ifstream existing(path, std::ios::in | std::ios::binary);
+    currentBytes_ = 0;
+    if (existing) {
+        existing.seekg(0, std::ios::end);
+        const std::streamoff size = existing.tellg();
+        if (size > 0) currentBytes_ = static_cast<std::uint64_t>(size);
+    }
+    output_.open(path, std::ios::out | std::ios::app | std::ios::binary);
+    if (!output_) {
+        throw std::runtime_error(
+            "Unable to open structured event file: " + path);
+    }
 }
 
 std::string StructuredEventWriter::nextId(const char* prefix) {
@@ -75,11 +123,19 @@ std::string StructuredEventWriter::nextId(const char* prefix) {
 
 void StructuredEventWriter::writeLine(const std::string& line) {
     std::lock_guard<std::mutex> lock(mutex_);
+    const std::uint64_t recordBytes =
+        static_cast<std::uint64_t>(line.size()) + 1ULL;
+    if (maxFileBytes_ > 0 && currentBytes_ > 0 &&
+        (currentBytes_ >= maxFileBytes_ ||
+         recordBytes > maxFileBytes_ - currentBytes_)) {
+        openPart(currentPart_ + 1);
+    }
     output_ << line << '\n';
     output_.flush();
     if (!output_) {
         throw std::runtime_error("Failed to write structured event data");
     }
+    currentBytes_ += recordBytes;
 }
 
 void StructuredEventWriter::recordSession(const std::string& mode) {

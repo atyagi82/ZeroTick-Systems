@@ -3,8 +3,9 @@
     "mode": "shadow_live",
     "force_login": true,
     "live_trading_confirmed": false,
-    "backtest_date": "2026-11-16",
-    "data_output_path": "data/shadow/2026-11-23.jsonl",
+    "backtest_date": "2026-11-06",
+    "data_output_path": "data/shadow/2026-11-24.jsonl",
+    "data_output_max_mb": 100,
     "historical_training_sessions": 100,
     "historical_validation_sessions": 100
   },
@@ -17,7 +18,7 @@
   "selection": {
     "min_price": 100.0,
     "require_nifty100": true,
-    "min_relative_volume": 1.2,
+    "min_relative_volume": 2.0,
     "min_absolute_volume": 50000,
     "max_spread_percent": 0.03,
     "min_depth_quantity": 1000.0,
@@ -34,26 +35,26 @@
   "decision": {
     "minimum_imbalance": 0.15,
     "maximum_spread_percent": 0.06850451148644784,
-    "target_percent": 0.926641065134189,
-    "stop_percent":0.28958279740568404,
+    "target_percent": 0.44,
+    "stop_percent":0.54,
     "require_volume_confirmation": true,
-    "min_relative_volume":  2.8672552873577155,
+    "min_relative_volume":  2.0,
     "indicative_entry_budget": 50000.0,
     "imbalance_level_weights": [1.0, 0.8, 0.6, 0.4, 0.2],
     "entry_trigger_offset_ticks": 0,
     "entry_limit_offset_ticks": 3,
     "required_confirmations": 3,
     "confirmation_interval_ms": 1000,
-    "worker_count": 4
+    "worker_count": 20
   },
   "handling": {
     "poll_interval_ms": 500,
     "entry_fill_timeout_seconds": 15,
     "exit_fill_timeout_seconds": 30,
     "max_holding_seconds": 8500,
-    "reversal_imbalance_threshold": 0.15,
-    "reversal_confirmations": 300,
-    "worker_count": 10
+    "reversal_imbalance_threshold": 0.45,
+    "reversal_confirmations": 500,
+    "worker_count": 20
   },
   "risk": {
     "max_open_positions": 20,

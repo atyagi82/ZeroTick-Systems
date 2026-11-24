@@ -274,6 +274,8 @@ historical mode can submit broker orders.
 
 - **Paper/shadow mode:** no broker orders are submitted by
   `TradeHandlingEngine`; shadow mode records structured JSONL events.
+  Shadow output rotates at the configured size without splitting records;
+  numbered parts retain the originating session ID for chronological replay.
 - **Live mode:** `run.mode: "live"` enables real Kite MIS order submission only
   when `run.live_trading_confirmed` is also true.
   Startup checks for existing MIS positions and open orders, reads available

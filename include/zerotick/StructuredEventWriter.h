@@ -14,7 +14,8 @@ namespace zerotick {
 
 class StructuredEventWriter {
 public:
-    explicit StructuredEventWriter(const std::string& path);
+    explicit StructuredEventWriter(const std::string& path,
+                                   std::uint64_t maxFileBytes = 0);
 
     void recordSession(const std::string& mode);
     void recordSnapshot(const MarketSnapshot& snapshot);
@@ -37,10 +38,17 @@ public:
 
 private:
     std::string nextId(const char* prefix);
+    std::string partPath(std::uint64_t part) const;
+    void openInitialPart();
+    void openPart(std::uint64_t part);
     void writeLine(const std::string& line);
 
     mutable std::mutex mutex_;
     std::ofstream output_;
+    std::string basePath_;
+    std::uint64_t maxFileBytes_ = 0;
+    std::uint64_t currentBytes_ = 0;
+    std::uint64_t currentPart_ = 1;
     std::string sessionId_;
     std::atomic<std::uint64_t> sequence_{0};
     std::atomic<std::uint64_t> snapshots_{0};

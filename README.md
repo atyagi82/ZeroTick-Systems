@@ -37,6 +37,13 @@ an alternate path when keeping separate sessions or experiments:
 
 Set `run.data_output_path` to choose a different JSONL destination.
 
+Set `run.data_output_max_mb` to rotate structured output before the next
+complete JSON record would exceed that size. A path such as
+`data/shadow/2026-11-24.jsonl` continues as
+`2026-11-24.part002.jsonl`, `part003`, and so on. Rotation never splits a JSON
+record, and every part retains the same session ID so the ML loader can ingest
+the files as one session.
+
 The output is JSON Lines: every line is an independent JSON object and is
 flushed immediately. Each object has `schema_version`, `session_id`,
 `event_id`, `event_type`, and `event_time_utc`. Candidate and signal IDs join

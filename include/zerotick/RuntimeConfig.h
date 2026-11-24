@@ -24,6 +24,7 @@ struct RunConfig {
     bool liveTradingConfirmed = false;
     std::string backtestDate;
     std::string dataOutputPath = "shadow_live_events.jsonl";
+    std::size_t dataOutputMaxMb = 100;
     std::size_t historicalTrainingSessions = 100;
     std::size_t historicalValidationSessions = 100;
 };
