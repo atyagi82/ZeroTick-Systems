@@ -4,7 +4,7 @@
     "force_login": true,
     "live_trading_confirmed": false,
     "backtest_date": "2026-11-06",
-    "data_output_path": "data/shadow/2026-11-24.jsonl",
+    "data_output_path": "data/shadow/2026-11-25.jsonl",
     "data_output_max_mb": 100,
     "historical_training_sessions": 100,
     "historical_validation_sessions": 100

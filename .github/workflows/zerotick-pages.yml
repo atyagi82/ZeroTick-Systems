@@ -1,12 +1,13 @@
 name: Deploy ZeroTick Portal
+run-name: Deploy ZeroTick Portal (${{ github.event_name }})
 
 on:
   push:
     branches: [main]
     paths:
-      - "website/dist/**"
+      - "website/**"
       - ".github/workflows/zerotick-pages.yml"
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -19,16 +20,29 @@ concurrency:
 
 jobs:
   deploy:
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+
+      - name: Validate portal bundle
+        shell: bash
+        run: |
+          test -s website/dist/index.html
+          test -s website/dist/styles.css
+          test -s website/dist/app.js
+          test -s website/dist/data/market.json
+          test -s website/dist/data/source.json
+          node --check website/dist/app.js
+          python -m json.tool website/dist/data/market.json > /dev/null
+          python -m json.tool website/dist/data/source.json > /dev/null
 
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Upload portal
         uses: actions/upload-pages-artifact@v3
@@ -37,4 +51,4 @@ jobs:
 
       - name: Deploy portal
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
